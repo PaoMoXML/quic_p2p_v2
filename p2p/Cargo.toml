@@ -1,0 +1,38 @@
+[package]
+name = "p2p"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.30.0"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+tokio = { version = "1.45.0", features = ["full"] }
+tokio-util = { version = "0.7.13", features = ["codec", "io-util"] }
+futures = "0.3.30"
+rootcause = { version = "0.11.0" }
+dashmap = { version = "6.1.0" }
+quinn = "0.11.6"
+memmap2 = "0.9.5"
+clap = { version = "4.5.32", features = ["derive"] }
+log = { version = "0.4.27" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["local-time", "time"] }
+chrono = { version = "0.4.40", features = ["serde"] }
+unicode-width = "0.2.0"
+rust-crypto = { version = "0.2.36" }
+serde = { workspace = true }
+serde_json = { version = "1.0.133" }
+bincode = { version = "2.0.1", features = ["serde"] }
+rustls = { version = "0.23.23", features = ["ring"], default-features = false }
+reqwest = { version = "0.12.28", features = ["blocking", "json", "stream"] }
+toml = { version = "0.9.8" }
+markdown = { version = "1.0.0", features = ["json"] }
+termcolor = "1.4.1"
+rand = { workspace = true }
+hyparview = { path = "../hyparview" }
+plumtree = { path = "../plumtree" }
+
+
+[features]
+default = ["serde"]
+serde = []
