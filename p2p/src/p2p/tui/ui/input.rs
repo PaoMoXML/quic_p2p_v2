@@ -29,12 +29,12 @@ pub enum InputEvent {
     ChangeStatus,
 }
 
-impl Into<InputEvent> for LogicEvent {
-    fn into(self) -> InputEvent {
-        match self {
+impl From<LogicEvent> for InputEvent {
+    fn from(val: LogicEvent) -> Self {
+        match val {
             LogicEvent::PeerListUpdated(hash_set) => InputEvent::PeersUpdating(hash_set),
             LogicEvent::NewMessageReceived(message) => InputEvent::MsgReceiving(message),
-            LogicEvent::Log(level, _) => todo!(),
+            LogicEvent::Log(_level, _) => todo!(),
         }
     }
 }

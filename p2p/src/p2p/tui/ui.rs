@@ -28,7 +28,7 @@ impl App {
 
         let [message_area, input_area] = main_vertical.areas(main_area);
 
-        let [peer_area, log_area] = sub_vertical.areas(sub_area);
+        let [_peer_area, _log_area] = sub_vertical.areas(sub_area);
 
         crate::p2p::tui::ui::message::ui(frame, &self.view_model.message_vm, message_area);
         crate::p2p::tui::ui::input::ui(frame, &self.view_model.input_vm, input_area);
@@ -53,11 +53,9 @@ impl Widget for &App {
             .title_alignment(Alignment::Center)
             .border_type(BorderType::Rounded);
 
-        let text = format!(
-            "This is a tui template.\n\
+        let text = "This is a tui template.\n\
                 Press `Esc`, `Ctrl-C` or `q` to stop running.\n\
-                Press left and right to increment and decrement the counter respectively.",
-        );
+                Press left and right to increment and decrement the counter respectively.".to_string();
 
         let paragraph = Paragraph::new(text)
             .block(block)

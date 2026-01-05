@@ -45,7 +45,7 @@ impl<M: MessagePayload> Future for P2PNodeServer<M> {
         let server = self.get_mut();
         // 只处理当前可用的命令，避免无限循环
         if let Poll::Ready(Some(command)) = server.command_rx.poll_recv(cx) {
-            tracing::info!("P2PNodeServer fetch message: {command:?}");
+            info!("P2PNodeServer fetch message: {command:?}");
             match command {
                 Command::Register(node_handle) => {
                     if server
@@ -126,7 +126,6 @@ impl<M: MessagePayload> ServerHandle<M> {
                 }
             }
         }
-        Ok(())
     }
 
     pub(crate) fn register_local_node(&self, node: NodeHandle<M>) {
@@ -158,7 +157,7 @@ impl<M: MessagePayload> ServerHandle<M> {
                 .insert(nodeid.local_id().clone(), connection.clone());
             connection
         };
-        return Ok(conn);
+        Ok(conn)
     }
 
     pub fn send_protocol_message(

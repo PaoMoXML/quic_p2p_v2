@@ -149,13 +149,12 @@ where
     ///
     /// This method should be invoked periodically to keep the active view full.
     pub fn fill_active_view(&mut self) {
-        if !self.is_active_view_full() {
-            if let Some(node) = self.select_random_from_passive_view() {
+        if !self.is_active_view_full()
+            && let Some(node) = self.select_random_from_passive_view() {
                 let high_priority = self.active_view.is_empty();
                 let message = ProtocolMessage::neighbor(&self.id, high_priority);
                 send(&mut self.actions, node, message);
             }
-        }
     }
 
     /// Sends `NEIGHBOR` message to the members of the active view for

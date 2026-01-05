@@ -1,6 +1,5 @@
 use ratatui::{
     Frame,
-    crossterm::event::{KeyCode, KeyEvent, KeyEventKind},
     layout::{Position, Rect},
     style::{Color, Style, Stylize},
     text::Span,

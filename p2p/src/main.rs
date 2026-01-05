@@ -3,7 +3,7 @@ use std::task::Poll;
 use futures::StreamExt;
 use rootcause::Report;
 use tokio::sync::mpsc;
-use tracing::{debug_span, span, warn};
+use tracing::{debug_span, warn};
 use tracing_subscriber::{
     fmt::{time, writer::MakeWriterExt},
     layer::SubscriberExt,
@@ -26,7 +26,7 @@ async fn main() -> Result<(), Report> {
         .with_line_number(true)
         .with_timer(time::LocalTime::rfc_3339())
         .with_ansi(true)
-        .with_writer(std::io::stderr.with_max_level(tracing::Level::WARN));
+        .with_writer(std::io::stderr.with_max_level(tracing::Level::DEBUG));
 
     tracing_subscriber::registry().with(stderr_layer).init();
 
@@ -45,7 +45,7 @@ async fn main() -> Result<(), Report> {
     ));
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let mut chat_node = ChatNode {
+    let chat_node = ChatNode {
         inner: p2pnode,
         message_rx: rx,
     };

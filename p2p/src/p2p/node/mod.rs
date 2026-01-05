@@ -1,13 +1,11 @@
-use std::{
-    marker::PhantomData, net::SocketAddr, sync::Arc, task::Poll, thread::sleep, time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, task::Poll, thread::sleep, time::Duration};
 
+use chrono::{DateTime, Utc};
 use crypto::{digest::Digest, sha2::Sha256};
-use dashmap::DashMap;
-use futures::{FutureExt, Stream, StreamExt, TryFutureExt};
+use futures::{Stream, StreamExt};
 use plumtree::time::NodeTime;
 use quinn::{
-    Connection, Endpoint, ServerConfig,
+    Endpoint, ServerConfig,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -16,22 +14,18 @@ use rustls::{
     RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject},
 };
-use tokio::{
-    sync::mpsc::{self, UnboundedReceiver},
-    time::{Timeout, timeout},
-};
-use tracing::{Level, debug, error, info, span, warn};
+use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tracing::{debug, info, warn};
 
 use crate::p2p::node::{
     message::{MessageId, MessagePayload, P2pNodeProtocolMessage},
     misc::{HyparviewAction, HyparviewNode, PlumtreeAction, PlumtreeAppMessage, PlumtreeNode},
-    node_id::{LocalNodeId, NodeId},
-    node_server::{NodeHandle, P2PNodeServer, ServerHandle},
+    node_id::NodeId,
+    node_server::{NodeHandle, ServerHandle},
 };
 
 pub mod message;
 mod misc;
-mod node_client;
 pub mod node_id;
 pub mod node_server;
 
@@ -46,7 +40,7 @@ pub struct P2PNode<M: MessagePayload> {
     hyparview_shuffle_time: NodeTime,
     hyparview_sync_active_view_time: NodeTime,
     hyparview_fill_active_view_time: NodeTime,
-    // tick_timeout: Timeout<String>,
+    last_tick_time: DateTime<Utc>,
 }
 
 impl<M: MessagePayload> P2PNode<M> {
@@ -65,7 +59,7 @@ impl<M: MessagePayload> P2PNode<M> {
 
         Ok(Self {
             hyparview_node: hyparview::Node::new(node_id, StdRng::from_seed(rand::rng().random())),
-            plumtree_node: plumtree_node,
+            plumtree_node,
             message_seqno: 0,
             server,
             message_rx,
@@ -73,7 +67,7 @@ impl<M: MessagePayload> P2PNode<M> {
             hyparview_shuffle_time,
             hyparview_sync_active_view_time,
             hyparview_fill_active_view_time,
-            // tick_timeout:
+            last_tick_time: Utc::now(),
         })
     }
 
@@ -236,8 +230,12 @@ impl<M: MessagePayload> Stream for P2PNode<M> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let node = self.get_mut();
-
-        sleep(node.params.tick_interval);
+        let now = Utc::now();
+        if now < node.last_tick_time + node.params.tick_interval {
+            let x = now + node.params.tick_interval - node.last_tick_time;
+            sleep(Duration::from_millis(x.num_milliseconds().abs() as u64));
+        }
+        // sleep(node.params.tick_interval);
         node.handle_tick();
 
         let mut did_something = true;
@@ -247,10 +245,10 @@ impl<M: MessagePayload> Stream for P2PNode<M> {
                 node.handle_hyparview_action(action);
             }
 
-            if let Some(action) = node.plumtree_node.poll_action() {
-                if let Some(message) = node.handle_plumtree_action(action) {
-                    return Poll::Ready(Some(message));
-                }
+            if let Some(action) = node.plumtree_node.poll_action()
+                && let Some(message) = node.handle_plumtree_action(action)
+            {
+                return Poll::Ready(Some(message));
             }
 
             while let Poll::Ready(Some(message)) = node.message_rx.poll_recv(cx) {
@@ -259,7 +257,7 @@ impl<M: MessagePayload> Stream for P2PNode<M> {
                 }
             }
         }
-
+        node.last_tick_time = Utc::now();
         cx.waker().wake_by_ref();
         Poll::Pending
     }

@@ -2,10 +2,10 @@ use ratatui::{
     DefaultTerminal,
     crossterm::{self, event::KeyEvent},
 };
-use rootcause::{Report, prelude::ResultExt};
+use rootcause::Report;
 
 use crate::p2p::{
-    model::{AppViewModel, input_view_model::InputViewModel, message_view_model::MessageViewModel},
+    model::AppViewModel,
     tui::{
         event::{AppEvent, Event, EventHandler},
         ui::{
@@ -61,10 +61,10 @@ impl App {
                         InputEvent::MsgReceiving(message) => {
                             self.view_model.message_vm.add_msg(message);
                         }
-                        InputEvent::PeersUpdating(hash_set) => todo!(),
+                        InputEvent::PeersUpdating(_hash_set) => todo!(),
                         InputEvent::ChangeStatus => {}
                     },
-                    AppEvent::Logging(log) => todo!(),
+                    AppEvent::Logging(_log) => todo!(),
                     AppEvent::Quit => self.quit(),
                 },
             }

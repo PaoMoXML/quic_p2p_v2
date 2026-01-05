@@ -1,6 +1,4 @@
-use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
-use std::{io, sync::Arc};
-use tokio::sync::mpsc;
+use ratatui::layout::Rect;
 
 use super::{
     model::{AutoScrollableViewModel, ViewModelFmt},
