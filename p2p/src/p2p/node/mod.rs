@@ -1,8 +1,11 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    marker::PhantomData, net::SocketAddr, sync::Arc, task::Poll, thread::sleep, time::Duration,
+};
 
 use crypto::{digest::Digest, sha2::Sha256};
 use dashmap::DashMap;
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt};
+use plumtree::time::NodeTime;
 use quinn::{
     Connection, Endpoint, ServerConfig,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
@@ -13,53 +16,76 @@ use rustls::{
     RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject},
 };
-use tracing::{debug, info};
+use tokio::{
+    sync::mpsc::{self, UnboundedReceiver},
+    time::{Timeout, timeout},
+};
+use tracing::{Level, debug, error, info, span, warn};
 
 use crate::p2p::node::{
-    message::{MessageId, MessagePayload},
+    message::{MessageId, MessagePayload, P2pNodeProtocolMessage},
     misc::{HyparviewAction, HyparviewNode, PlumtreeAction, PlumtreeAppMessage, PlumtreeNode},
-    node_id::NodeId,
+    node_id::{LocalNodeId, NodeId},
+    node_server::{NodeHandle, P2PNodeServer, ServerHandle},
 };
 
 pub mod message;
 mod misc;
 mod node_client;
 pub mod node_id;
-mod node_server;
+pub mod node_server;
 
 #[derive(Debug)]
 pub struct P2PNode<M: MessagePayload> {
     hyparview_node: HyparviewNode,
     plumtree_node: PlumtreeNode<M>,
-    endpoint: Endpoint,
-    connections: DashMap<NodeId, Connection>,
     message_seqno: u64,
+    server: ServerHandle<M>,
+    message_rx: UnboundedReceiver<P2pNodeProtocolMessage<M>>,
+    params: Parameters,
+    hyparview_shuffle_time: NodeTime,
+    hyparview_sync_active_view_time: NodeTime,
+    hyparview_fill_active_view_time: NodeTime,
+    // tick_timeout: Timeout<String>,
 }
 
 impl<M: MessagePayload> P2PNode<M> {
-    pub fn new(endpoint: Endpoint) -> Result<Self, Report> {
-        let node_id = NodeId::new(endpoint.local_addr()?, uuid());
+    pub fn new(node_id: NodeId, server: ServerHandle<M>) -> Result<Self, Report> {
+        let (message_tx, message_rx) = mpsc::unbounded_channel();
+        let node_handle = NodeHandle::new(node_id.local_id().clone(), message_tx);
+        server.register_local_node(node_handle);
+        let plumtree_node = plumtree::Node::new(node_id.clone());
+        let now = plumtree_node.clock().now();
+        let params = Parameters::default();
+        let hyparview_shuffle_time = now + gen_interval(params.hyparview_shuffle_interval);
+        let hyparview_sync_active_view_time =
+            now + gen_interval(params.hyparview_sync_active_view_interval);
+        let hyparview_fill_active_view_time =
+            now + gen_interval(params.hyparview_fill_active_view_interval);
+
         Ok(Self {
-            hyparview_node: hyparview::Node::new(
-                node_id.clone(),
-                StdRng::from_seed(rand::rng().random()),
-            ),
-            plumtree_node: plumtree::Node::new(node_id),
-            endpoint: endpoint,
-            connections: DashMap::new(),
+            hyparview_node: hyparview::Node::new(node_id, StdRng::from_seed(rand::rng().random())),
+            plumtree_node: plumtree_node,
             message_seqno: 0,
+            server,
+            message_rx,
+            params,
+            hyparview_shuffle_time,
+            hyparview_sync_active_view_time,
+            hyparview_fill_active_view_time,
+            // tick_timeout:
         })
     }
 
-    /// Joins the cluster to which the given contact node belongs.
+    /// 加入给定联系人节点所属的集群。
     pub fn join(&mut self, contact_node: NodeId) {
         info!("Joins a cluster by contacting to {:?}", contact_node);
         self.hyparview_node.join(contact_node);
     }
 
-    /// Broadcasts a message.
+    /// 广播一条消息。
     ///
-    /// Note that the message will also be delivered to the sender node.
+    /// 请注意，该消息也会发送给发送节点。
     pub fn broadcast(&mut self, message_payload: M) -> MessageId {
         let id = MessageId::new(self.id(), self.message_seqno);
         self.message_seqno += 1;
@@ -73,7 +99,7 @@ impl<M: MessagePayload> P2PNode<M> {
         id
     }
 
-    /// Returns the identifier of the node.
+    /// 返回节点的标识符。
     pub fn id(&self) -> NodeId {
         self.plumtree_node().id().clone()
     }
@@ -84,14 +110,46 @@ impl<M: MessagePayload> P2PNode<M> {
     }
 
     fn handle_hyparview_action(&mut self, action: HyparviewAction) {
-        tracing::info!(HyparviewAction=?action);
         match action {
             hyparview::Action::Send {
                 destination,
                 message,
-            } => {}
-            hyparview::Action::Disconnect { node } => todo!(),
-            hyparview::Action::Notify { event } => todo!(),
+            } => {
+                debug!(
+                    "Sends a HyParView message to {:?}: {:?}",
+                    destination, message
+                );
+                if let Err(e) = self.server.send_protocol_message(
+                    destination.clone(),
+                    P2pNodeProtocolMessage::Hyparview(message),
+                ) {
+                    warn!(
+                        "Cannot send a HyParView message to {:?}: {}",
+                        destination, e
+                    );
+                }
+            }
+            hyparview::Action::Notify { event } => match event {
+                hyparview::Event::NeighborUp { node } => {
+                    info!(
+                        "Neighbor up: {:?} (active_view={:?})",
+                        node,
+                        self.hyparview_node.active_view()
+                    );
+                    self.plumtree_node.handle_neighbor_up(&node);
+                }
+                hyparview::Event::NeighborDown { node } => {
+                    info!(
+                        "Neighbor down: {:?} (active_view={:?})",
+                        node,
+                        self.hyparview_node.active_view()
+                    );
+                    self.plumtree_node.handle_neighbor_down(&node);
+                }
+            },
+            hyparview::Action::Disconnect { node } => {
+                info!("Disconnected: {:?}", node);
+            }
         }
     }
 
@@ -99,23 +157,74 @@ impl<M: MessagePayload> P2PNode<M> {
         &mut self,
         action: PlumtreeAction<M>,
     ) -> Option<PlumtreeAppMessage<M>> {
-        tracing::info!(PlumtreeAction=?action);
         match action {
             plumtree::Action::Send {
                 destination,
                 message,
-            } => match message {
-                plumtree::message::ProtocolMessage::Gossip(gossip_message) => todo!(),
-                plumtree::message::ProtocolMessage::Ihave(ihave_message) => todo!(),
-                plumtree::message::ProtocolMessage::Graft(graft_message) => todo!(),
-                plumtree::message::ProtocolMessage::Prune(prune_message) => todo!(),
-            },
-            plumtree::Action::Deliver { message } => todo!(),
+            } => {
+                debug!("Sends a Plumtree message to {:?}", destination);
+                if let Err(e) = self.server.send_protocol_message(
+                    destination.clone(),
+                    P2pNodeProtocolMessage::Plumtree(message),
+                ) {
+                    warn!("Cannot send a Plumtree message to {:?}: {}", destination, e);
+                }
+                None
+            }
+            plumtree::Action::Deliver { message } => {
+                debug!("Delivers an application message: {:?}", message.id);
+                Some(PlumtreeAppMessage::from(message))
+            }
         }
     }
 
+    fn handle_p2pnode_protocol_message(&mut self, message: P2pNodeProtocolMessage<M>) -> bool {
+        match message {
+            P2pNodeProtocolMessage::Hyparview(m) => {
+                debug!("Received a HyParView message: {:?}", m);
+                self.hyparview_node.handle_protocol_message(m);
+                true
+            }
+            P2pNodeProtocolMessage::Plumtree(m) => {
+                debug!("Received a Plumtree message");
+                if !self.plumtree_node.handle_protocol_message(m) {
+                    // self.metrics.unknown_plumtree_node_errors.increment();
+                }
+                false
+            }
+        }
+    }
+
+    fn handle_tick(&mut self) {
+        self.plumtree_node
+            .clock_mut()
+            .tick(self.params.tick_interval);
+
+        let now = self.plumtree_node.clock().now();
+        if now >= self.hyparview_shuffle_time {
+            self.hyparview_node.shuffle_passive_view();
+            self.hyparview_shuffle_time =
+                now + gen_interval(self.params.hyparview_shuffle_interval);
+        }
+        if now >= self.hyparview_sync_active_view_time {
+            self.hyparview_node.sync_active_view();
+            self.hyparview_sync_active_view_time =
+                now + gen_interval(self.params.hyparview_sync_active_view_interval);
+        }
+        if now >= self.hyparview_fill_active_view_time {
+            self.hyparview_node.fill_active_view();
+            self.hyparview_fill_active_view_time =
+                now + gen_interval(self.params.hyparview_fill_active_view_interval);
+        }
+    }
+
+    // #[instrument]
     pub async fn run(&mut self) {
-        while let Some(next) = self.next().await {}
+        info!("Your peer id: {}", self.hyparview_node.id().local_id());
+        while let Some(next) = self.next().await {
+            debug!("Main loop fetch message: {:?}: {:?}", next.id, next.payload);
+        }
+        info!("next finish");
     }
 }
 
@@ -124,21 +233,35 @@ impl<M: MessagePayload> Stream for P2PNode<M> {
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let node = self.get_mut();
-        let action = node.hyparview_node.poll_action();
-        if let Some(action) = action {
-            node.handle_hyparview_action(action);
+
+        sleep(node.params.tick_interval);
+        node.handle_tick();
+
+        let mut did_something = true;
+        while did_something {
+            did_something = false;
+            if let Some(action) = node.hyparview_node.poll_action() {
+                node.handle_hyparview_action(action);
+            }
+
+            if let Some(action) = node.plumtree_node.poll_action() {
+                if let Some(message) = node.handle_plumtree_action(action) {
+                    return Poll::Ready(Some(message));
+                }
+            }
+
+            while let Poll::Ready(Some(message)) = node.message_rx.poll_recv(cx) {
+                if node.handle_p2pnode_protocol_message(message) {
+                    break;
+                }
+            }
         }
 
-        if let Some(action) = node.plumtree_node.poll_action() {
-            if let Some(message) = node.handle_plumtree_action(action) {
-                return std::task::Poll::Ready(Some(message));
-            };
-        }
-
-        std::task::Poll::Pending
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -183,3 +306,31 @@ pub fn create_endpoint(addr: SocketAddr) -> Result<Endpoint, Report> {
 
     Ok(endpoint)
 }
+
+#[derive(Debug, Clone)]
+struct Parameters {
+    tick_interval: Duration,
+    hyparview_shuffle_interval: Duration,
+    hyparview_sync_active_view_interval: Duration,
+    hyparview_fill_active_view_interval: Duration,
+}
+
+impl Default for Parameters {
+    fn default() -> Self {
+        Self {
+            tick_interval: Duration::from_millis(200),
+            hyparview_shuffle_interval: Duration::from_secs(300),
+            hyparview_sync_active_view_interval: Duration::from_secs(60),
+            hyparview_fill_active_view_interval: Duration::from_secs(30),
+        }
+    }
+}
+
+fn gen_interval(base: Duration) -> Duration {
+    let millis = base.as_secs() * 1000 + u64::from(base.subsec_millis());
+    let jitter = rand::random::<u64>() % (millis / 10);
+    base + Duration::from_millis(jitter)
+}
+
+#[test]
+fn test() {}

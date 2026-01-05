@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::p2p::node::{misc::PlumtreeSystem, node_id::NodeId};
 
@@ -26,12 +26,13 @@ impl MessageId {
 }
 
 pub trait MessagePayload:
-    Sized + Clone + Send + 'static + std::marker::Unpin + Debug + Serialize + Deserialize<'static>
+    Sized + Clone + Send + Sync + 'static + std::marker::Unpin + Debug + Serialize + DeserializeOwned
 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum P2pNodeProtocolMessage<T: Clone> {
-    Hyparview(hyparview::message::ProtocolMessage<T>),
+    Hyparview(hyparview::message::ProtocolMessage<NodeId>),
     Plumtree(plumtree::message::ProtocolMessage<PlumtreeSystem<T>>),
 }
+
