@@ -24,10 +24,13 @@ use crate::p2p::node::{
     node_server::{NodeHandle, ServerHandle},
 };
 
+pub mod Args;
 pub mod message;
 mod misc;
 pub mod node_id;
 pub mod node_server;
+
+const TICK_FPS: f64 = 30.0;
 
 #[derive(Debug)]
 pub struct P2PNode<M: MessagePayload> {
@@ -113,15 +116,22 @@ impl<M: MessagePayload> P2PNode<M> {
                     "Sends a HyParView message to {:?}: {:?}",
                     destination, message
                 );
-                if let Err(e) = self.server.send_protocol_message(
+                // if let Err(e) = self.server.send_protocol_message(
+                //     destination.clone(),
+                //     P2pNodeProtocolMessage::Hyparview(message),
+                // ) {
+                //     self.hyparview_node.disconnect(&destination, false);
+                //     self.server.remove_remote_node(destination.local_id());
+                //     warn!(
+                //         "Cannot send a HyParView message to {:?}: {}",
+                //         destination, e
+                //     );
+                // }
+
+                self.server.send_protocol_message_sync(
                     destination.clone(),
                     P2pNodeProtocolMessage::Hyparview(message),
-                ) {
-                    warn!(
-                        "Cannot send a HyParView message to {:?}: {}",
-                        destination, e
-                    );
-                }
+                );
             }
             hyparview::Action::Notify { event } => match event {
                 hyparview::Event::NeighborUp { node } => {
@@ -142,6 +152,8 @@ impl<M: MessagePayload> P2PNode<M> {
                 }
             },
             hyparview::Action::Disconnect { node } => {
+                self.hyparview_node.disconnect(&node, false);
+                self.server.remove_remote_node(node.local_id());
                 info!("Disconnected: {:?}", node);
             }
         }
@@ -157,12 +169,19 @@ impl<M: MessagePayload> P2PNode<M> {
                 message,
             } => {
                 debug!("Sends a Plumtree message to {:?}", destination);
-                if let Err(e) = self.server.send_protocol_message(
+                // if let Err(e) = self.server.send_protocol_message(
+                //     destination.clone(),
+                //     P2pNodeProtocolMessage::Plumtree(message),
+                // ) {
+                //     self.hyparview_node.disconnect(&destination, false);
+                //     self.server.remove_remote_node(destination.local_id());
+                //     warn!("Cannot send a Plumtree message to {:?}: {}", destination, e);
+                // }
+
+                self.server.send_protocol_message_sync(
                     destination.clone(),
                     P2pNodeProtocolMessage::Plumtree(message),
-                ) {
-                    warn!("Cannot send a Plumtree message to {:?}: {}", destination, e);
-                }
+                );
                 None
             }
             plumtree::Action::Deliver { message } => {
@@ -212,13 +231,34 @@ impl<M: MessagePayload> P2PNode<M> {
         }
     }
 
-    // #[instrument]
-    pub async fn run(&mut self) {
-        info!("Your peer id: {}", self.hyparview_node.id().local_id());
-        while let Some(next) = self.next().await {
-            debug!("Main loop fetch message: {:?}: {:?}", next.id, next.payload);
+    pub fn leave(&self) {
+        use hyparview::message::{DisconnectMessage, ProtocolMessage};
+
+        info!(
+            "Leaves the current cluster: active_view={:?}",
+            self.hyparview_node.active_view()
+        );
+        for peer in self.hyparview_node.active_view().iter().cloned() {
+            let message = DisconnectMessage {
+                sender: self.id(),
+                alive: false,
+            };
+            let message = ProtocolMessage::Disconnect(message);
+            let message = P2pNodeProtocolMessage::Hyparview(message);
+            if let Err(e) = self.server.send_protocol_message(peer, message) {
+                warn!("Leave err: {e}");
+            }
         }
-        info!("next finish");
+
+        // 等待一小段时间以确保消息发送
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+// todo 好像没有执行完就结束了
+impl<M: MessagePayload> Drop for P2PNode<M> {
+    fn drop(&mut self) {
+        self.leave();
     }
 }
 
@@ -235,7 +275,6 @@ impl<M: MessagePayload> Stream for P2PNode<M> {
             let x = now + node.params.tick_interval - node.last_tick_time;
             sleep(Duration::from_millis(x.num_milliseconds().abs() as u64));
         }
-        // sleep(node.params.tick_interval);
         node.handle_tick();
 
         let mut did_something = true;
@@ -316,7 +355,7 @@ struct Parameters {
 impl Default for Parameters {
     fn default() -> Self {
         Self {
-            tick_interval: Duration::from_millis(200),
+            tick_interval: Duration::from_secs_f64(1.0 / TICK_FPS),
             hyparview_shuffle_interval: Duration::from_secs(300),
             hyparview_sync_active_view_interval: Duration::from_secs(60),
             hyparview_fill_active_view_interval: Duration::from_secs(30),

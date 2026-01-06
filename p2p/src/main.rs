@@ -1,9 +1,10 @@
-use std::task::Poll;
+use std::{task::Poll, thread::sleep, time::Duration};
 
+use clap::Parser;
 use futures::StreamExt;
 use rootcause::Report;
 use tokio::sync::mpsc;
-use tracing::{debug_span, warn};
+use tracing::{debug, debug_span, warn};
 use tracing_subscriber::{
     fmt::{time, writer::MakeWriterExt},
     layer::SubscriberExt,
@@ -11,6 +12,7 @@ use tracing_subscriber::{
 };
 
 use crate::p2p::node::{
+    Args::Args,
     P2PNode,
     message::MessagePayload,
     node_id::{LocalNodeId, NodeId},
@@ -19,6 +21,7 @@ use crate::p2p::node::{
 };
 
 mod p2p;
+
 #[tokio::main]
 async fn main() -> Result<(), Report> {
     let stderr_layer = tracing_subscriber::fmt::layer()
@@ -26,23 +29,24 @@ async fn main() -> Result<(), Report> {
         .with_line_number(true)
         .with_timer(time::LocalTime::rfc_3339())
         .with_ansi(true)
-        .with_writer(std::io::stderr.with_max_level(tracing::Level::DEBUG));
+        .with_writer(std::io::stderr.with_max_level(tracing::Level::INFO));
 
     tracing_subscriber::registry().with(stderr_layer).init();
-
-    let addr = "127.0.0.1:8002";
-    let span = debug_span!("init", address = addr);
+    let span = debug_span!("init");
     let _enter = span.enter();
-    let endpoint = p2p::node::create_endpoint(addr.parse()?)?;
+
+
+    let args = Args::parse();
+    let addr = args.local_addr;
+    let endpoint = p2p::node::create_endpoint(addr)?;
     let local_id = LocalNodeId::new(uuid());
     let node_id = NodeId::new(endpoint.local_addr()?, local_id.clone());
-    let server = P2PNodeServer::new(endpoint, "localhost".to_string());
+    let server = P2PNodeServer::new(endpoint, args.server_name);
     let mut p2pnode = P2PNode::<String>::new(node_id, server.handle())?;
 
-    p2pnode.join(NodeId::new(
-        "127.0.0.1:8001".parse()?,
-        LocalNodeId::new(uuid()),
-    ));
+    if let Some(remote_addr) = args.remote_addr {
+        p2pnode.join(NodeId::new(remote_addr, LocalNodeId::new(uuid())));
+    }
 
     let (tx, rx) = mpsc::unbounded_channel();
     let chat_node = ChatNode {
@@ -50,25 +54,19 @@ async fn main() -> Result<(), Report> {
         message_rx: rx,
     };
 
-    let han = server.handle();
+    let handle = server.handle();
     tokio::spawn(async move {
-        let span = debug_span!("run", address = addr);
+        let span = debug_span!("start_server");
         let _enter = span.enter();
-        if let Err(e) = han.start_server().await {
+        if let Err(e) = handle.start_server().await {
             warn!("start server err: {e:?}");
         };
     });
 
     tokio::spawn(async move {
-        let span = debug_span!("server", address = addr);
+        let span = debug_span!("server");
         let _enter = span.enter();
         server.await;
-    });
-
-    tokio::spawn(async move {
-        let span = debug_span!("start_server", address = addr);
-        let _enter = span.enter();
-        chat_node.await;
     });
 
     tokio::spawn(async move {
@@ -85,6 +83,10 @@ async fn main() -> Result<(), Report> {
             }
         }
     });
+
+    let span = debug_span!("chat_node");
+    let _enter = span.enter();
+    chat_node.await;
 
     tokio::signal::ctrl_c().await?;
     Ok(())
@@ -104,7 +106,7 @@ impl Future for ChatNode {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let span = debug_span!("ChatNode poll", address = "127.0.0.1:8002");
+        let span = debug_span!("ChatNode poll");
         let _enter = span.enter();
 
         let chat_node = self.get_mut();
@@ -112,7 +114,12 @@ impl Future for ChatNode {
 
         // 处理来自内部P2P节点的消息
         while let Poll::Ready(Some(m)) = chat_node.inner.poll_next_unpin(cx) {
-            println!("# MESSAGE: {:?}", m);
+            println!(
+                "# MESSAGE: {} ({}) --> {}",
+                m.id.node().local_id(),
+                m.id.seqno(),
+                m.payload
+            );
             processed_messages = true;
         }
 
