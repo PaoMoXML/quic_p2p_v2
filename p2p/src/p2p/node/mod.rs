@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc, task::Poll, thread::sleep, time::Duration}
 
 use chrono::{DateTime, Utc};
 use crypto::{digest::Digest, sha2::Sha256};
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use plumtree::time::NodeTime;
 use quinn::{
     Endpoint, ServerConfig,
@@ -24,7 +24,7 @@ use crate::p2p::node::{
     node_server::{NodeHandle, ServerHandle},
 };
 
-pub mod Args;
+pub mod args;
 pub mod message;
 mod misc;
 pub mod node_id;
@@ -273,7 +273,7 @@ impl<M: MessagePayload> Stream for P2PNode<M> {
         let now = Utc::now();
         if now < node.last_tick_time + node.params.tick_interval {
             let x = now + node.params.tick_interval - node.last_tick_time;
-            sleep(Duration::from_millis(x.num_milliseconds().abs() as u64));
+            sleep(Duration::from_millis(x.num_milliseconds().unsigned_abs()));
         }
         node.handle_tick();
 

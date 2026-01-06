@@ -1,7 +1,7 @@
-use std::{pin::pin, sync::Arc, task::Poll};
+use std::{sync::Arc, task::Poll};
 
 use dashmap::DashMap;
-use futures::{FutureExt, SinkExt, Stream, StreamExt};
+use futures::{SinkExt, StreamExt};
 use hyparview::message::{DisconnectMessage, ProtocolMessage};
 use quinn::{Connection, Endpoint};
 use rootcause::{Report, prelude::ResultExt};

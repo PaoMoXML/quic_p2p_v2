@@ -1,10 +1,10 @@
-use std::{task::Poll, thread::sleep, time::Duration};
+use std::task::Poll;
 
 use clap::Parser;
 use futures::StreamExt;
 use rootcause::Report;
 use tokio::sync::mpsc;
-use tracing::{debug, debug_span, warn};
+use tracing::{debug_span, warn};
 use tracing_subscriber::{
     fmt::{time, writer::MakeWriterExt},
     layer::SubscriberExt,
@@ -12,8 +12,8 @@ use tracing_subscriber::{
 };
 
 use crate::p2p::node::{
-    Args::Args,
     P2PNode,
+    args::Args,
     message::MessagePayload,
     node_id::{LocalNodeId, NodeId},
     node_server::P2PNodeServer,
@@ -34,7 +34,6 @@ async fn main() -> Result<(), Report> {
     tracing_subscriber::registry().with(stderr_layer).init();
     let span = debug_span!("init");
     let _enter = span.enter();
-
 
     let args = Args::parse();
     let addr = args.local_addr;
