@@ -15,6 +15,10 @@ impl LocalNodeId {
     pub fn value(self) -> String {
         self.0
     }
+
+    pub fn short(&self) -> &str {
+        self.0.split_at(5).0
+    }
 }
 
 impl Deref for LocalNodeId {

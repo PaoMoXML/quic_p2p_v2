@@ -1,11 +1,14 @@
-use std::{sync::Arc, task::Poll};
+use std::{sync::Arc, task::Poll, thread::sleep, time::Duration};
 
 use dashmap::DashMap;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use hyparview::message::{DisconnectMessage, ProtocolMessage};
-use quinn::{Connection, Endpoint};
+use quinn::{ApplicationClose, Connection, Endpoint};
 use rootcause::{Report, prelude::ResultExt};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    Mutex,
+    mpsc::{self, UnboundedReceiver, UnboundedSender},
+};
 use tokio_util::{
     bytes::Bytes,
     codec::{FramedRead, FramedWrite, LengthDelimitedCodec},
@@ -32,6 +35,7 @@ impl<M: MessagePayload> P2PNodeServer<M> {
             local_nodes: Arc::new(DashMap::new()),
             remote_nodes: Arc::new(DashMap::new()),
             command_tx,
+            connection_locks: Arc::new(DashMap::new()),
         };
         P2PNodeServer { command_rx, handle }
     }
@@ -49,8 +53,15 @@ impl<M: MessagePayload> Future for P2PNodeServer<M> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let server = self.get_mut();
+        let handle = server.handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle.start_server().await {
+                warn!("Server err: {e:?}");
+            };
+        });
+
         // 只处理当前可用的命令，避免无限循环
-        if let Poll::Ready(Some(command)) = server.command_rx.poll_recv(cx) {
+        while let Poll::Ready(Some(command)) = server.command_rx.poll_recv(cx) {
             debug!("P2PNodeServer fetch a command: {command:?}");
             match command {
                 Command::Register(node_handle) => {
@@ -73,13 +84,9 @@ impl<M: MessagePayload> Future for P2PNodeServer<M> {
                     server.handle.local_nodes.remove(&local_node_id);
                 }
             }
-            // 有命令处理后，立即重新调度以处理更多命令
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        } else {
-            // 如果没有更多命令待处理，则返回 Pending，等待新命令时由接收器唤醒
-            std::task::Poll::Pending
         }
+        // 返回 Pending，等待新命令时由接收器唤醒
+        std::task::Poll::Pending
     }
 }
 
@@ -90,10 +97,10 @@ pub struct ServerHandle<M: MessagePayload> {
     local_nodes: Arc<DashMap<LocalNodeId, NodeHandle<M>>>,
     command_tx: UnboundedSender<Command<M>>,
     remote_nodes: Arc<DashMap<LocalNodeId, Connection>>,
+    connection_locks: Arc<DashMap<LocalNodeId, Arc<Mutex<()>>>>,
 }
 
 impl<M: MessagePayload> ServerHandle<M> {
-
     /// 启动quic客户端
     pub async fn start_server(&self) -> Result<(), Report> {
         info!("Server listen on: {}", self.endpoint.local_addr()?);
@@ -124,22 +131,41 @@ impl<M: MessagePayload> ServerHandle<M> {
 
     /// 监听连接
     async fn handle_connection(&self, conn: Connection) -> Result<(), Report> {
+        let addr = conn.remote_address();
         loop {
-            let (_tx, rx) = conn.accept_bi().await?;
-            let mut framed_reader = FramedRead::new(rx, LengthDelimitedCodec::new());
-            while let Some(bytes_mut) = framed_reader.next().await {
-                let bytes = bytes_mut?;
-                let p2p_node_protocol_message: P2pNodeProtocolMessage<M> =
-                    serde_json::from_slice(&bytes)?;
-                debug!("Fetch a message: {p2p_node_protocol_message:?}");
+            match conn.accept_bi().await {
+                Ok((_tx, rx)) => {
+                    let mut framed_reader = FramedRead::new(rx, LengthDelimitedCodec::new());
+                    while let Some(bytes_mut) = framed_reader.next().await {
+                        let bytes = bytes_mut?;
+                        let p2p_node_protocol_message: P2pNodeProtocolMessage<M> =
+                            serde_json::from_slice(&bytes)?;
+                        debug!("Fetch a message: {p2p_node_protocol_message:?}");
 
-                match self.local_nodes.iter().last() {
-                    Some(node) => {
-                        node.message_tx.send(p2p_node_protocol_message)?;
+                        match self.local_nodes.iter().last() {
+                            Some(node) => {
+                                node.message_tx.send(p2p_node_protocol_message)?;
+                            }
+                            None => {
+                                warn!("Local nodes is Empty")
+                            }
+                        }
                     }
-                    None => {
-                        warn!("Local nodes is Empty")
-                    }
+                }
+                Err(quinn::ConnectionError::ApplicationClosed(ApplicationClose {
+                    error_code,
+                    reason,
+                })) => {
+                    debug!(
+                        "IP: {} Closed: error_code={}, reason={}",
+                        addr,
+                        error_code,
+                        String::from_utf8_lossy(&reason)
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    rootcause::bail!(e);
                 }
             }
         }
@@ -162,24 +188,42 @@ impl<M: MessagePayload> ServerHandle<M> {
 
     async fn get_connection(&self, nodeid: &NodeId) -> Result<Connection, Report> {
         let addr = nodeid.address();
-        let conn = if let Some(conn) = self.remote_nodes.get(nodeid.local_id()) {
-            conn.clone()
-        } else {
-            // 发起连接
-            let connection = self
-                .endpoint
-                .connect(
-                    addr,
-                    &self.server_name, // 必须与证书中的域名匹配
-                )?
-                .await
-                .context(format!("连接到节点: {addr}出错"))?;
-            log::info!("Connected to server: {:?}", connection.remote_address());
-            self.remote_nodes
-                .insert(nodeid.local_id().clone(), connection.clone());
-            connection
-        };
-        Ok(conn)
+
+        // 首先检查是否已存在连接
+        if let Some(conn) = self.remote_nodes.get(nodeid.local_id()) {
+            return Ok(conn.clone());
+        }
+
+        let lock = self
+            .connection_locks
+            .entry(nodeid.local_id().clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+
+        let _guard = lock.lock().await;
+
+        // 双重检查，确保在获取锁后没有其他任务已经建立了连接
+        if let Some(conn) = self.remote_nodes.get(nodeid.local_id()) {
+            return Ok(conn.clone());
+        }
+
+        // 使用 DashMap 的 entry API 来避免竞态条件
+        // 如果没有现成的连接，创建一个新的
+        let connection = self
+            .endpoint
+            .connect(
+                addr,
+                &self.server_name, // 必须与证书中的域名匹配
+            )?
+            .await
+            .context(format!("连接到节点: {addr}出错"))?;
+        info!("Connected to server: {:?}", connection.remote_address());
+
+        // 将连接存入缓存
+        self.remote_nodes
+            .insert(nodeid.local_id().clone(), connection.clone());
+
+        Ok(connection)
     }
 
     /// 异步的消息发送
@@ -195,7 +239,7 @@ impl<M: MessagePayload> ServerHandle<M> {
                 .await
             {
                 // 由于在新行程里执行的异步消息发送，所以无法直接返回错误，使用消息管道进行发送
-                handle.notify_disconnect(&destination);
+                handle.notify_self_disconnect(&destination);
                 warn!("Quinn cannot send message to {destination:?}: {e}");
             };
         });
@@ -234,7 +278,7 @@ impl<M: MessagePayload> ServerHandle<M> {
 
     /// 提醒断联
     /// 发送给本地节点，destination需要断联
-    fn notify_disconnect(&self, destination: &NodeId) {
+    pub fn notify_self_disconnect(&self, destination: &NodeId) {
         // 无法发送消息，发送断联
         let message = DisconnectMessage {
             sender: destination.clone(),

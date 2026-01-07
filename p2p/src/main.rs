@@ -4,6 +4,7 @@ use clap::Parser;
 use futures::StreamExt;
 use rootcause::Report;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug_span, warn};
 use tracing_subscriber::{
     fmt::{time, writer::MakeWriterExt},
@@ -32,7 +33,7 @@ async fn main() -> Result<(), Report> {
         .with_writer(std::io::stderr.with_max_level(tracing::Level::INFO));
 
     tracing_subscriber::registry().with(stderr_layer).init();
-    let span = debug_span!("init");
+    let span = debug_span!("Init");
     let _enter = span.enter();
 
     let args = Args::parse();
@@ -48,25 +49,17 @@ async fn main() -> Result<(), Report> {
     }
 
     let (tx, rx) = mpsc::unbounded_channel();
+    let token = CancellationToken::new();
+    let cloned_token = token.clone();
     let chat_node = ChatNode {
         inner: p2pnode,
         message_rx: rx,
+        cloned_token,
     };
 
     let handle = server.handle();
-    tokio::spawn(async move {
-        let span = debug_span!("start_server");
-        let _enter = span.enter();
-        if let Err(e) = handle.start_server().await {
-            warn!("start server err: {e:?}");
-        };
-    });
-
-    tokio::spawn(async move {
-        let span = debug_span!("server");
-        let _enter = span.enter();
-        server.await;
-    });
+    tokio::spawn(server);
+    tokio::spawn(chat_node);
 
     tokio::spawn(async move {
         use std::io::BufRead;
@@ -83,11 +76,9 @@ async fn main() -> Result<(), Report> {
         }
     });
 
-    let span = debug_span!("chat_node");
-    let _enter = span.enter();
-    chat_node.await;
-
-    tokio::signal::ctrl_c().await?;
+    // tokio::signal::ctrl_c().await?;
+    token.cancelled().await;
+    handle.stop_server().await?;
     Ok(())
 }
 
@@ -96,6 +87,7 @@ impl MessagePayload for String {}
 struct ChatNode {
     inner: P2PNode<String>,
     message_rx: mpsc::UnboundedReceiver<String>,
+    cloned_token: CancellationToken,
 }
 
 impl Future for ChatNode {
@@ -114,11 +106,16 @@ impl Future for ChatNode {
         // 处理来自内部P2P节点的消息
         while let Poll::Ready(Some(m)) = chat_node.inner.poll_next_unpin(cx) {
             println!(
-                "# MESSAGE: {} ({}) --> {}",
-                m.id.node().local_id(),
+                "# MESSAGE: {}@{} --> {}",
+                m.id.node().local_id().short(),
                 m.id.seqno(),
                 m.payload
             );
+            // 退出
+            if m.payload == "quit" {
+                chat_node.inner.leave();
+                chat_node.cloned_token.cancel();
+            }
             processed_messages = true;
         }
 

@@ -116,18 +116,6 @@ impl<M: MessagePayload> P2PNode<M> {
                     "Sends a HyParView message to {:?}: {:?}",
                     destination, message
                 );
-                // if let Err(e) = self.server.send_protocol_message(
-                //     destination.clone(),
-                //     P2pNodeProtocolMessage::Hyparview(message),
-                // ) {
-                //     self.hyparview_node.disconnect(&destination, false);
-                //     self.server.remove_remote_node(destination.local_id());
-                //     warn!(
-                //         "Cannot send a HyParView message to {:?}: {}",
-                //         destination, e
-                //     );
-                // }
-
                 self.server.send_protocol_message_sync(
                     destination.clone(),
                     P2pNodeProtocolMessage::Hyparview(message),
@@ -169,15 +157,6 @@ impl<M: MessagePayload> P2PNode<M> {
                 message,
             } => {
                 debug!("Sends a Plumtree message to {:?}", destination);
-                // if let Err(e) = self.server.send_protocol_message(
-                //     destination.clone(),
-                //     P2pNodeProtocolMessage::Plumtree(message),
-                // ) {
-                //     self.hyparview_node.disconnect(&destination, false);
-                //     self.server.remove_remote_node(destination.local_id());
-                //     warn!("Cannot send a Plumtree message to {:?}: {}", destination, e);
-                // }
-
                 self.server.send_protocol_message_sync(
                     destination.clone(),
                     P2pNodeProtocolMessage::Plumtree(message),
@@ -201,7 +180,7 @@ impl<M: MessagePayload> P2PNode<M> {
             P2pNodeProtocolMessage::Plumtree(m) => {
                 debug!("Received a Plumtree message");
                 if !self.plumtree_node.handle_protocol_message(m) {
-                    // self.metrics.unknown_plumtree_node_errors.increment();
+                    warn!("Unknown plumtree node errors")
                 }
                 false
             }
@@ -231,7 +210,7 @@ impl<M: MessagePayload> P2PNode<M> {
         }
     }
 
-    pub fn leave(&self) {
+    pub fn leave(&mut self) {
         use hyparview::message::{DisconnectMessage, ProtocolMessage};
 
         info!(
@@ -245,22 +224,20 @@ impl<M: MessagePayload> P2PNode<M> {
             };
             let message = ProtocolMessage::Disconnect(message);
             let message = P2pNodeProtocolMessage::Hyparview(message);
+            self.server.notify_self_disconnect(&peer);
             if let Err(e) = self.server.send_protocol_message(peer, message) {
                 warn!("Leave err: {e}");
             }
         }
-
-        // 等待一小段时间以确保消息发送
-        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
 // todo 好像没有执行完就结束了
-impl<M: MessagePayload> Drop for P2PNode<M> {
-    fn drop(&mut self) {
-        self.leave();
-    }
-}
+// impl<M: MessagePayload> Drop for P2PNode<M> {
+//     fn drop(&mut self) {
+//         self.leave();
+//     }
+// }
 
 impl<M: MessagePayload> Stream for P2PNode<M> {
     type Item = PlumtreeAppMessage<M>;
@@ -272,7 +249,7 @@ impl<M: MessagePayload> Stream for P2PNode<M> {
         let node = self.get_mut();
         let now = Utc::now();
         if now < node.last_tick_time + node.params.tick_interval {
-            let x = now + node.params.tick_interval - node.last_tick_time;
+            let x = now + node.params.tick_interval - node.last_tick_time;            
             sleep(Duration::from_millis(x.num_milliseconds().unsigned_abs()));
         }
         node.handle_tick();
@@ -280,17 +257,20 @@ impl<M: MessagePayload> Stream for P2PNode<M> {
         let mut did_something = true;
         while did_something {
             did_something = false;
-            if let Some(action) = node.hyparview_node.poll_action() {
+            while let Some(action) = node.hyparview_node.poll_action() {
                 node.handle_hyparview_action(action);
+                did_something = true;
             }
 
-            if let Some(action) = node.plumtree_node.poll_action()
-                && let Some(message) = node.handle_plumtree_action(action)
-            {
-                return Poll::Ready(Some(message));
+            while let Some(action) = node.plumtree_node.poll_action() {
+                if let Some(message) = node.handle_plumtree_action(action) {
+                    return Poll::Ready(Some(message));
+                }
+                did_something = true;
             }
 
             while let Poll::Ready(Some(message)) = node.message_rx.poll_recv(cx) {
+                did_something = true;
                 if node.handle_p2pnode_protocol_message(message) {
                     break;
                 }
