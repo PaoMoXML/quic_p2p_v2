@@ -12,15 +12,19 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
-use crate::p2p::node::{
-    P2PNode,
-    args::Args,
-    message::MessagePayload,
-    node_id::{LocalNodeId, NodeId},
-    node_server::P2PNodeServer,
-    uuid,
+use crate::{
+    chat::{ChatMessage, ChatNode},
+    p2p::node::{
+        P2PNode,
+        args::Args,
+        message::MessagePayload,
+        node_id::{LocalNodeId, NodeId},
+        node_server::P2PNodeServer,
+        uuid,
+    },
 };
 
+mod chat;
 mod p2p;
 
 #[tokio::main]
@@ -42,7 +46,7 @@ async fn main() -> Result<(), Report> {
     let local_id = LocalNodeId::new(uuid());
     let node_id = NodeId::new(endpoint.local_addr()?, local_id.clone());
     let server = P2PNodeServer::new(endpoint, args.server_name);
-    let mut p2pnode = P2PNode::<String>::new(node_id, server.handle())?;
+    let mut p2pnode = P2PNode::<ChatMessage>::new(node_id, server.handle())?;
 
     if let Some(remote_addr) = args.remote_addr {
         p2pnode.join(NodeId::new(remote_addr, LocalNodeId::new(uuid())));
@@ -51,27 +55,38 @@ async fn main() -> Result<(), Report> {
     let (tx, rx) = mpsc::unbounded_channel();
     let token = CancellationToken::new();
     let cloned_token = token.clone();
-    let chat_node = ChatNode {
-        inner: p2pnode,
-        message_rx: rx,
-        cloned_token,
-    };
+    let chat_node = ChatNode::new(p2pnode, rx, cloned_token);
 
     let handle = server.handle();
     tokio::spawn(server);
     tokio::spawn(chat_node);
 
     tokio::spawn(async move {
-        use std::io::BufRead;
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let line = if let Ok(line) = line {
-                line
-            } else {
-                break;
-            };
-            if tx.send(line).is_err() {
-                break;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let stdin = tokio::io::stdin();
+        let mut reader = BufReader::new(stdin);
+        let mut line = String::new();
+
+        loop {
+            let user = local_id.clone();
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    let msg = ChatMessage::new(
+                        chrono::Local::now(),
+                        line.trim().to_string(),
+                        chat::UserType::User(user),
+                    );
+                    if tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("Error reading stdin: {}", e);
+                    break;
+                }
             }
         }
     });
@@ -80,57 +95,4 @@ async fn main() -> Result<(), Report> {
     token.cancelled().await;
     handle.stop_server().await?;
     Ok(())
-}
-
-impl MessagePayload for String {}
-
-struct ChatNode {
-    inner: P2PNode<String>,
-    message_rx: mpsc::UnboundedReceiver<String>,
-    cloned_token: CancellationToken,
-}
-
-impl Future for ChatNode {
-    type Output = ();
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let span = debug_span!("ChatNode poll");
-        let _enter = span.enter();
-
-        let chat_node = self.get_mut();
-        let mut processed_messages = false;
-
-        // 处理来自内部P2P节点的消息
-        while let Poll::Ready(Some(m)) = chat_node.inner.poll_next_unpin(cx) {
-            println!(
-                "# MESSAGE: {}@{} --> {}",
-                m.id.node().local_id().short(),
-                m.id.seqno(),
-                m.payload
-            );
-            // 退出
-            if m.payload == "quit" {
-                chat_node.inner.leave();
-                chat_node.cloned_token.cancel();
-            }
-            processed_messages = true;
-        }
-
-        // 处理来自消息接收器的消息
-        while let Poll::Ready(Some(msg)) = chat_node.message_rx.poll_recv(cx) {
-            chat_node.inner.broadcast(msg);
-            processed_messages = true;
-        }
-
-        // 如果处理了消息，需要重新调度以检查是否有更多消息
-        // 但为了避免繁忙等待，我们只在有新消息时才唤醒
-        if processed_messages {
-            cx.waker().wake_by_ref();
-        }
-
-        Poll::Pending
-    }
 }

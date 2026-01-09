@@ -1,8 +1,7 @@
-pub mod node;
- mod app;
- mod controller;
-mod gossipsub;
+mod app;
+mod controller;
 mod gpt;
 mod model;
+pub mod node;
 mod tui;
 mod view;

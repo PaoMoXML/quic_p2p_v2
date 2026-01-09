@@ -1,4 +1,4 @@
-use std::{sync::Arc, task::Poll, thread::sleep, time::Duration};
+use std::{sync::Arc, task::Poll};
 
 use dashmap::DashMap;
 use futures::{FutureExt, SinkExt, StreamExt};
@@ -22,6 +22,7 @@ use crate::p2p::node::{
 
 #[derive(Debug)]
 pub struct P2PNodeServer<M: MessagePayload> {
+    server_is_running: bool,
     command_rx: UnboundedReceiver<Command<M>>,
     handle: ServerHandle<M>,
 }
@@ -37,7 +38,11 @@ impl<M: MessagePayload> P2PNodeServer<M> {
             command_tx,
             connection_locks: Arc::new(DashMap::new()),
         };
-        P2PNodeServer { command_rx, handle }
+        P2PNodeServer {
+            server_is_running: false,
+            command_rx,
+            handle,
+        }
     }
 
     pub fn handle(&self) -> ServerHandle<M> {
@@ -54,11 +59,14 @@ impl<M: MessagePayload> Future for P2PNodeServer<M> {
     ) -> std::task::Poll<Self::Output> {
         let server = self.get_mut();
         let handle = server.handle.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle.start_server().await {
-                warn!("Server err: {e:?}");
-            };
-        });
+        if !server.server_is_running {
+            server.server_is_running = true;
+            tokio::spawn(async move {
+                if let Err(e) = handle.start_server().await {
+                    warn!("Server err: {e:?}");
+                };
+            });
+        }
 
         // 只处理当前可用的命令，避免无限循环
         while let Poll::Ready(Some(command)) = server.command_rx.poll_recv(cx) {
@@ -112,9 +120,7 @@ impl<M: MessagePayload> ServerHandle<M> {
                     let connection = conn.await?;
                     let handle = self.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle.handle_connection(connection).await {
-                            error!("Handle connection err: {e}");
-                        }
+                        handle.handle_connection(connection).await;
                     });
                 }
                 None => break,
@@ -130,44 +136,67 @@ impl<M: MessagePayload> ServerHandle<M> {
     }
 
     /// 监听连接
-    async fn handle_connection(&self, conn: Connection) -> Result<(), Report> {
+    async fn handle_connection(&self, conn: Connection) {
         let addr = conn.remote_address();
-        loop {
-            match conn.accept_bi().await {
-                Ok((_tx, rx)) => {
-                    let mut framed_reader = FramedRead::new(rx, LengthDelimitedCodec::new());
-                    while let Some(bytes_mut) = framed_reader.next().await {
-                        let bytes = bytes_mut?;
-                        let p2p_node_protocol_message: P2pNodeProtocolMessage<M> =
-                            serde_json::from_slice(&bytes)?;
-                        debug!("Fetch a message: {p2p_node_protocol_message:?}");
-
-                        match self.local_nodes.iter().last() {
-                            Some(node) => {
-                                node.message_tx.send(p2p_node_protocol_message)?;
+        let mut connection_id = None;
+        let mut hanle = async || -> Result<(), Report> {
+            loop {
+                match conn.accept_bi().await {
+                    Ok((_tx, rx)) => {
+                        let mut framed_reader = FramedRead::new(rx, LengthDelimitedCodec::new());
+                        while let Some(bytes_mut) = framed_reader.next().await {
+                            let bytes = bytes_mut?;
+                            let p2p_node_protocol_message: P2pNodeProtocolMessage<M> =
+                                serde_json::from_slice(&bytes)?;
+                            debug!("Fetch a message: {p2p_node_protocol_message:?}");
+                            if connection_id.is_none() {
+                                let node_id = match &p2p_node_protocol_message {
+                                    P2pNodeProtocolMessage::Hyparview(protocol_message) => {
+                                        protocol_message.sender().clone()
+                                    }
+                                    P2pNodeProtocolMessage::Plumtree(protocol_message) => {
+                                        protocol_message.sender().clone()
+                                    }
+                                };
+                                debug!("Handle a connection from: {node_id:?}");
+                                connection_id = Some(node_id);
                             }
-                            None => {
-                                warn!("Local nodes is Empty")
+
+                            match self.local_nodes.iter().last() {
+                                Some(node) => {
+                                    node.message_tx.send(p2p_node_protocol_message)?;
+                                }
+                                None => {
+                                    warn!("Local nodes is Empty")
+                                }
                             }
                         }
                     }
-                }
-                Err(quinn::ConnectionError::ApplicationClosed(ApplicationClose {
-                    error_code,
-                    reason,
-                })) => {
-                    debug!(
-                        "IP: {} Closed: error_code={}, reason={}",
-                        addr,
+                    Err(quinn::ConnectionError::ApplicationClosed(ApplicationClose {
                         error_code,
-                        String::from_utf8_lossy(&reason)
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    rootcause::bail!(e);
+                        reason,
+                    })) => {
+                        debug!(
+                            "IP: {} Closed: error_code={}, reason={}",
+                            addr,
+                            error_code,
+                            String::from_utf8_lossy(&reason)
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        return Err(Report::from(e));
+                    }
                 }
             }
+        };
+
+        if let Err(e) = hanle().await {
+            error!("Handle connection err: {e}");
+        }
+        // 已经退出循环了，发送断联消息
+        if let Some(connection_id) = connection_id {
+            self.notify_self_disconnect(&connection_id);
         }
     }
 
@@ -207,7 +236,6 @@ impl<M: MessagePayload> ServerHandle<M> {
             return Ok(conn.clone());
         }
 
-        // 使用 DashMap 的 entry API 来避免竞态条件
         // 如果没有现成的连接，创建一个新的
         let connection = self
             .endpoint

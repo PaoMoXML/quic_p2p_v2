@@ -1,4 +1,10 @@
-use std::{net::SocketAddr, sync::Arc, task::Poll, thread::sleep, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    task::{Poll, Waker},
+    thread::sleep,
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 use crypto::{digest::Digest, sha2::Sha256};
@@ -30,7 +36,7 @@ mod misc;
 pub mod node_id;
 pub mod node_server;
 
-const TICK_FPS: f64 = 30.0;
+const TICK_FPS: f64 = 10.0;
 
 #[derive(Debug)]
 pub struct P2PNode<M: MessagePayload> {
@@ -43,7 +49,7 @@ pub struct P2PNode<M: MessagePayload> {
     hyparview_shuffle_time: NodeTime,
     hyparview_sync_active_view_time: NodeTime,
     hyparview_fill_active_view_time: NodeTime,
-    last_tick_time: DateTime<Utc>,
+    tick_interval: Option<tokio::time::Interval>,
 }
 
 impl<M: MessagePayload> P2PNode<M> {
@@ -60,6 +66,8 @@ impl<M: MessagePayload> P2PNode<M> {
         let hyparview_fill_active_view_time =
             now + gen_interval(params.hyparview_fill_active_view_interval);
 
+        let tick_interval = params.tick_interval.clone();
+
         Ok(Self {
             hyparview_node: hyparview::Node::new(node_id, StdRng::from_seed(rand::rng().random())),
             plumtree_node,
@@ -70,7 +78,7 @@ impl<M: MessagePayload> P2PNode<M> {
             hyparview_shuffle_time,
             hyparview_sync_active_view_time,
             hyparview_fill_active_view_time,
-            last_tick_time: Utc::now(),
+            tick_interval: Some(tokio::time::interval(tick_interval)),
         })
     }
 
@@ -247,12 +255,12 @@ impl<M: MessagePayload> Stream for P2PNode<M> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let node = self.get_mut();
-        let now = Utc::now();
-        if now < node.last_tick_time + node.params.tick_interval {
-            let x = now + node.params.tick_interval - node.last_tick_time;            
-            sleep(Duration::from_millis(x.num_milliseconds().unsigned_abs()));
+        if let Some(interval) = node.tick_interval.as_mut() {
+            if interval.poll_tick(cx).is_ready() {
+                node.handle_tick();
+                cx.waker().wake_by_ref();
+            }
         }
-        node.handle_tick();
 
         let mut did_something = true;
         while did_something {
@@ -276,8 +284,6 @@ impl<M: MessagePayload> Stream for P2PNode<M> {
                 }
             }
         }
-        node.last_tick_time = Utc::now();
-        cx.waker().wake_by_ref();
         Poll::Pending
     }
 }
@@ -349,5 +355,127 @@ fn gen_interval(base: Duration) -> Duration {
     base + Duration::from_millis(jitter)
 }
 
-#[test]
-fn test() {}
+#[cfg(test)]
+mod tests {
+    use std::{task::Poll, time::Duration};
+
+    use futures::{Stream, StreamExt};
+    use log::warn;
+    use tokio::sync::mpsc;
+    use tracing::{info, info_span};
+    use tracing_subscriber::{
+        fmt::{time, writer::MakeWriterExt},
+        layer::SubscriberExt,
+        util::SubscriberInitExt,
+    };
+
+    struct Foo {
+        tick_interval: tokio::time::Interval,
+        rx: mpsc::UnboundedReceiver<String>,
+    }
+
+    impl Foo {
+        fn new(tick_interval: tokio::time::Interval, rx: mpsc::UnboundedReceiver<String>) -> Self {
+            Self { tick_interval, rx }
+        }
+    }
+
+    impl Stream for Foo {
+        type Item = ();
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let span = info_span!("Next");
+            let _enter = span.enter();
+
+            let m = self.get_mut();
+
+            let poll_tick = m.tick_interval.poll_tick(cx);
+
+            if poll_tick.is_ready() {
+                info!("tick");
+                cx.waker().wake_by_ref();
+                // return Poll::Ready(Some(()));
+            }
+
+            while let Poll::Ready(Some(x)) = m.rx.poll_recv(cx) {
+                info!("next: {x}");
+                return Poll::Ready(Some(()));
+            }
+            Poll::Pending
+        }
+    }
+
+    struct Bar {
+        foo: Foo,
+    }
+
+    impl Future for Bar {
+        type Output = ();
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<Self::Output> {
+            let bar = self.get_mut();
+
+            while let Poll::Ready(Some(_)) = bar.foo.poll_next_unpin(cx) {
+                warn!(" bar.foo ready something");
+                // cx.waker().wake_by_ref();
+                // cx.waker().wake_by_ref();
+            }
+            warn!(" bar execute Pending");
+            Poll::Pending
+        }
+    }
+
+    // #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn test_future() {
+        let stderr_layer = tracing_subscriber::fmt::layer()
+            .with_file(true)
+            .with_line_number(true)
+            .with_timer(time::LocalTime::rfc_3339())
+            .with_ansi(true)
+            .with_writer(std::io::stderr.with_max_level(tracing::Level::DEBUG));
+
+        tracing_subscriber::registry().with(stderr_layer).init();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let foo = Foo::new(tokio::time::interval(Duration::from_secs(1)), rx);
+
+        // 使用tokio::io::AsyncBufRead来异步读取stdin，而不是阻塞的stdin
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+
+            let stdin = tokio::io::stdin();
+            let mut reader = BufReader::new(stdin);
+            let mut line = String::new();
+
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        info!("send: {}", line.trim());
+                        if tx.send(line.trim().to_string()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        info!("Error reading stdin: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        let bar = Bar { foo };
+
+        tokio::spawn(bar);
+        tokio::signal::ctrl_c().await.unwrap();
+    }
+}
