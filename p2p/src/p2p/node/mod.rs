@@ -1,12 +1,10 @@
 use std::{
     net::SocketAddr,
     sync::Arc,
-    task::{Poll, Waker},
-    thread::sleep,
+    task::Poll,
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
 use crypto::{digest::Digest, sha2::Sha256};
 use futures::Stream;
 use plumtree::time::NodeTime;
@@ -66,7 +64,7 @@ impl<M: MessagePayload> P2PNode<M> {
         let hyparview_fill_active_view_time =
             now + gen_interval(params.hyparview_fill_active_view_interval);
 
-        let tick_interval = params.tick_interval.clone();
+        let tick_interval = params.tick_interval;
 
         Ok(Self {
             hyparview_node: hyparview::Node::new(node_id, StdRng::from_seed(rand::rng().random())),
@@ -255,12 +253,11 @@ impl<M: MessagePayload> Stream for P2PNode<M> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let node = self.get_mut();
-        if let Some(interval) = node.tick_interval.as_mut() {
-            if interval.poll_tick(cx).is_ready() {
+        if let Some(interval) = node.tick_interval.as_mut()
+            && interval.poll_tick(cx).is_ready() {
                 node.handle_tick();
                 cx.waker().wake_by_ref();
             }
-        }
 
         let mut did_something = true;
         while did_something {

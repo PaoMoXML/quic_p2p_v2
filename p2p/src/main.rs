@@ -1,7 +1,4 @@
-use std::task::Poll;
-
 use clap::Parser;
-use futures::StreamExt;
 use rootcause::Report;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -17,7 +14,6 @@ use crate::{
     p2p::node::{
         P2PNode,
         args::Args,
-        message::MessagePayload,
         node_id::{LocalNodeId, NodeId},
         node_server::P2PNodeServer,
         uuid,
@@ -34,21 +30,30 @@ async fn main() -> Result<(), Report> {
         .with_line_number(true)
         .with_timer(time::LocalTime::rfc_3339())
         .with_ansi(true)
-        .with_writer(std::io::stderr.with_max_level(tracing::Level::INFO));
+        .with_writer(std::io::stderr.with_max_level(tracing::Level::DEBUG));
 
     tracing_subscriber::registry().with(stderr_layer).init();
-    let span = debug_span!("Init");
-    let _enter = span.enter();
+
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .unwrap();
 
     let args = Args::parse();
     let addr = args.local_addr;
     let endpoint = p2p::node::create_endpoint(addr)?;
     let local_id = LocalNodeId::new(uuid());
-    let node_id = NodeId::new(endpoint.local_addr()?, local_id.clone());
+    let node_id = NodeId::new(
+        if args.public_addr.is_none() {
+            endpoint.local_addr()?
+        } else {
+            args.public_addr.unwrap()
+        },
+        local_id.clone(),
+    );
     let server = P2PNodeServer::new(endpoint, args.server_name);
     let mut p2pnode = P2PNode::<ChatMessage>::new(node_id, server.handle())?;
 
-    if let Some(remote_addr) = args.remote_addr {
+    if let Some(remote_addr) = args.connect_to {
         p2pnode.join(NodeId::new(remote_addr, LocalNodeId::new(uuid())));
     }
 

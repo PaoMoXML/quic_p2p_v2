@@ -5,7 +5,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug_span, warn};
+use tracing::debug_span;
 
 use crate::p2p::node::{P2PNode, message::MessagePayload, node_id::LocalNodeId};
 
@@ -85,9 +85,6 @@ impl Future for ChatNode {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let span = debug_span!("ChatNode poll");
-        let _enter = span.enter();
-
         let chat_node = self.get_mut();
 
         // 处理来自内部P2P节点的消息

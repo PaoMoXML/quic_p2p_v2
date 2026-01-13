@@ -1,7 +1,7 @@
 use std::{sync::Arc, task::Poll};
 
 use dashmap::DashMap;
-use futures::{FutureExt, SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt};
 use hyparview::message::{DisconnectMessage, ProtocolMessage};
 use quinn::{ApplicationClose, Connection, Endpoint};
 use rootcause::{Report, prelude::ResultExt};
@@ -110,6 +110,7 @@ pub struct ServerHandle<M: MessagePayload> {
 
 impl<M: MessagePayload> ServerHandle<M> {
     /// 启动quic客户端
+    #[tracing::instrument(skip_all, fields(local_addr=%self.endpoint.local_addr().expect("never fails").to_string()))]
     pub async fn start_server(&self) -> Result<(), Report> {
         info!("Server listen on: {}", self.endpoint.local_addr()?);
         // 接受传入连接
@@ -136,6 +137,7 @@ impl<M: MessagePayload> ServerHandle<M> {
     }
 
     /// 监听连接
+    #[tracing::instrument(skip_all, fields(sender, remote_addr=conn.remote_address().to_string()))]
     async fn handle_connection(&self, conn: Connection) {
         let addr = conn.remote_address();
         let mut connection_id = None;
@@ -148,7 +150,7 @@ impl<M: MessagePayload> ServerHandle<M> {
                             let bytes = bytes_mut?;
                             let p2p_node_protocol_message: P2pNodeProtocolMessage<M> =
                                 serde_json::from_slice(&bytes)?;
-                            debug!("Fetch a message: {p2p_node_protocol_message:?}");
+                            debug!("Fetch a protocol message: {p2p_node_protocol_message:?}");
                             if connection_id.is_none() {
                                 let node_id = match &p2p_node_protocol_message {
                                     P2pNodeProtocolMessage::Hyparview(protocol_message) => {
@@ -159,6 +161,15 @@ impl<M: MessagePayload> ServerHandle<M> {
                                     }
                                 };
                                 debug!("Handle a connection from: {node_id:?}");
+                                tracing::Span::current().record(
+                                    "sender",
+                                    format!(
+                                        "NodeId ( address: {}, local_id: {} )",
+                                        node_id.address(),
+                                        node_id.local_id()
+                                    ),
+                                );
+                                // self.set_connection(&node_id, conn.clone()).await;
                                 connection_id = Some(node_id);
                             }
 
@@ -213,6 +224,20 @@ impl<M: MessagePayload> ServerHandle<M> {
 
     pub fn remove_remote_node(&self, node: &LocalNodeId) {
         self.remote_nodes.remove(node);
+    }
+
+    async fn set_connection(&self, nodeid: &NodeId, conn: Connection) {
+        let lock = self
+            .connection_locks
+            .entry(nodeid.local_id().clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        if let None = self.remote_nodes.get(nodeid.local_id()) {
+            // 将连接存入缓存
+            self.remote_nodes.insert(nodeid.local_id().clone(), conn);
+        }
     }
 
     async fn get_connection(&self, nodeid: &NodeId) -> Result<Connection, Report> {
@@ -291,11 +316,13 @@ impl<M: MessagePayload> ServerHandle<M> {
 
     /// 执行异步的消息发送
     /// 实际的消息发送将会在这里发送
+    #[tracing::instrument(skip_all, fields(sender = %self.endpoint.local_addr().expect("never fails").to_string()))]
     pub async fn send_protocol_message_async(
         &self,
         destination: NodeId,
         protocol_message: P2pNodeProtocolMessage<M>,
     ) -> Result<(), Report> {
+        debug!("Send a protocol message: {protocol_message:?} to {destination:?}");
         let protocol_message = serde_json::to_vec(&protocol_message)?;
         let connection = self.get_connection(&destination).await?;
         let (tx, _rx) = connection.open_bi().await?;
