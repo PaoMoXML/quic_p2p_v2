@@ -1,4 +1,7 @@
-use std::{sync::Arc, task::Poll};
+use std::{
+    sync::{Arc, RwLock},
+    task::Poll,
+};
 
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -23,24 +26,20 @@ use crate::p2p::node::{
 #[derive(Debug)]
 pub struct P2PNodeServer<M: MessagePayload> {
     server_is_running: bool,
-    command_rx: UnboundedReceiver<Command<M>>,
     handle: ServerHandle<M>,
 }
 
 impl<M: MessagePayload> P2PNodeServer<M> {
     pub fn new(endpoint: Endpoint, server_name: String) -> Self {
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
         let handle = ServerHandle {
             server_name,
             endpoint,
-            local_nodes: Arc::new(DashMap::new()),
+            local_nodes: Arc::new(RwLock::new(None)),
             remote_nodes: Arc::new(DashMap::new()),
-            command_tx,
             connection_locks: Arc::new(DashMap::new()),
         };
         P2PNodeServer {
             server_is_running: false,
-            command_rx,
             handle,
         }
     }
@@ -55,7 +54,7 @@ impl<M: MessagePayload> Future for P2PNodeServer<M> {
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let server = self.get_mut();
         let handle = server.handle.clone();
@@ -67,32 +66,6 @@ impl<M: MessagePayload> Future for P2PNodeServer<M> {
                 };
             });
         }
-
-        // 只处理当前可用的命令，避免无限循环
-        while let Poll::Ready(Some(command)) = server.command_rx.poll_recv(cx) {
-            debug!("P2PNodeServer fetch a command: {command:?}");
-            match command {
-                Command::Register(node_handle) => {
-                    if server
-                        .handle
-                        .local_nodes
-                        .contains_key(&node_handle.local_id)
-                    {
-                        warn!("Local node has been registered"); // 修复拼写错误
-                    } else {
-                        info!("Registers a local node: {:?}", node_handle.local_id);
-                        server
-                            .handle
-                            .local_nodes
-                            .insert(node_handle.local_id.clone(), node_handle);
-                    }
-                }
-                Command::Deregister(local_node_id) => {
-                    info!("Deregisters a local node: {:?}", local_node_id);
-                    server.handle.local_nodes.remove(&local_node_id);
-                }
-            }
-        }
         // 返回 Pending，等待新命令时由接收器唤醒
         std::task::Poll::Pending
     }
@@ -102,8 +75,7 @@ impl<M: MessagePayload> Future for P2PNodeServer<M> {
 pub struct ServerHandle<M: MessagePayload> {
     server_name: String,
     endpoint: Endpoint,
-    local_nodes: Arc<DashMap<LocalNodeId, NodeHandle<M>>>,
-    command_tx: UnboundedSender<Command<M>>,
+    local_nodes: Arc<RwLock<Option<(LocalNodeId, NodeHandle<M>)>>>,
     remote_nodes: Arc<DashMap<LocalNodeId, Connection>>,
     connection_locks: Arc<DashMap<LocalNodeId, Arc<Mutex<()>>>>,
 }
@@ -117,13 +89,17 @@ impl<M: MessagePayload> ServerHandle<M> {
         loop {
             // 接受新连接
             match self.endpoint.accept().await {
-                Some(conn) => {
-                    let connection = conn.await?;
-                    let handle = self.clone();
-                    tokio::spawn(async move {
-                        handle.handle_connection(connection).await;
-                    });
-                }
+                Some(conn) => match conn.await {
+                    Ok(connection) => {
+                        let handle = self.clone();
+                        tokio::spawn(async move {
+                            handle.handle_connection(connection).await;
+                        });
+                    }
+                    Err(e) => {
+                        warn!("Server accept connect err: {e}");
+                    }
+                },
                 None => break,
             }
         }
@@ -173,12 +149,9 @@ impl<M: MessagePayload> ServerHandle<M> {
                                 connection_id = Some(node_id);
                             }
 
-                            match self.local_nodes.iter().last() {
-                                Some(node) => {
+                            if let Ok(read) = self.local_nodes.read() {
+                                if let Some((_id, node)) = read.as_ref() {
                                     node.message_tx.send(p2p_node_protocol_message)?;
-                                }
-                                None => {
-                                    warn!("Local nodes is Empty")
                                 }
                             }
                         }
@@ -213,31 +186,13 @@ impl<M: MessagePayload> ServerHandle<M> {
 
     /// 注册本地的节点
     pub(crate) fn register_local_node(&self, node: NodeHandle<M>) {
-        let command = Command::Register(node);
-        let _ = self.command_tx.send(command);
-    }
-
-    pub(crate) fn deregister_local_node(&self, node: LocalNodeId) {
-        let command = Command::Deregister(node);
-        let _ = self.command_tx.send(command);
+        if let Ok(mut write) = self.local_nodes.write() {
+            write.replace((node.local_id.clone(), node));
+        }
     }
 
     pub fn remove_remote_node(&self, node: &LocalNodeId) {
         self.remote_nodes.remove(node);
-    }
-
-    async fn set_connection(&self, nodeid: &NodeId, conn: Connection) {
-        let lock = self
-            .connection_locks
-            .entry(nodeid.local_id().clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let _guard = lock.lock().await;
-
-        if let None = self.remote_nodes.get(nodeid.local_id()) {
-            // 将连接存入缓存
-            self.remote_nodes.insert(nodeid.local_id().clone(), conn);
-        }
     }
 
     async fn get_connection(&self, nodeid: &NodeId) -> Result<Connection, Report> {
@@ -341,16 +296,12 @@ impl<M: MessagePayload> ServerHandle<M> {
         };
         let message = ProtocolMessage::Disconnect(message);
         let message = P2pNodeProtocolMessage::Hyparview(message);
-        if !self.local_nodes.is_empty() {
-            let _ = self
-                .local_nodes
-                .iter()
-                .last()
-                .expect("never fails")
-                .message_tx
-                .send(message);
-            self.remove_remote_node(destination.local_id());
+        if let Ok(read) = self.local_nodes.read() {
+            if let Some((_id, node)) = read.as_ref() {
+                let _ = node.message_tx.send(message);
+            }
         }
+        self.remove_remote_node(destination.local_id());
     }
 }
 

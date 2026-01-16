@@ -31,6 +31,8 @@ termcolor = "1.4.1"
 rand = { workspace = true }
 hyparview = { path = "../hyparview" }
 plumtree = { path = "../plumtree" }
+rcgen = "0.14.6"
+# stun_codec ={ version = "0.4"}
 
 
 [features]

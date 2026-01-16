@@ -5,3 +5,4 @@ mod model;
 pub mod node;
 mod tui;
 mod view;
+mod server_verification;

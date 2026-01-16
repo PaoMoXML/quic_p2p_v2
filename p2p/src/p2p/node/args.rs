@@ -1,15 +1,12 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::net::SocketAddr;
 
 use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Args {
-    /// 证书地址
-    #[arg(short = 'c', long)]
-    pub cert_addr: PathBuf,
     /// 服务名
-    #[arg(short = 's', long)]
+    #[arg(short = 's', long, default_value = "localhost")]
     pub server_name: String,
     /// 启动地址
     #[arg(short = 'l', long)]

@@ -21,12 +21,12 @@ use rustls::{
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tracing::{debug, info, warn};
 
-use crate::p2p::node::{
+use crate::p2p::{node::{
     message::{MessageId, MessagePayload, P2pNodeProtocolMessage},
     misc::{HyparviewAction, HyparviewNode, PlumtreeAction, PlumtreeAppMessage, PlumtreeNode},
     node_id::NodeId,
     node_server::{NodeHandle, ServerHandle},
-};
+}, server_verification::SkipServerVerification};
 
 pub mod args;
 pub mod message;
@@ -179,12 +179,12 @@ impl<M: MessagePayload> P2PNode<M> {
     fn handle_p2pnode_protocol_message(&mut self, message: P2pNodeProtocolMessage<M>) -> bool {
         match message {
             P2pNodeProtocolMessage::Hyparview(m) => {
-                debug!("Received a HyParView message: {:?}", m);
+                debug!("Received a HyParView message: {m:?}");
                 self.hyparview_node.handle_protocol_message(m);
                 true
             }
             P2pNodeProtocolMessage::Plumtree(m) => {
-                debug!("Received a Plumtree message");
+                debug!("Received a Plumtree message: {m:?}");
                 if !self.plumtree_node.handle_protocol_message(m) {
                     warn!("Unknown plumtree node errors")
                 }
@@ -238,12 +238,6 @@ impl<M: MessagePayload> P2PNode<M> {
     }
 }
 
-// todo 好像没有执行完就结束了
-// impl<M: MessagePayload> Drop for P2PNode<M> {
-//     fn drop(&mut self) {
-//         self.leave();
-//     }
-// }
 
 impl<M: MessagePayload> Stream for P2PNode<M> {
     type Item = PlumtreeAppMessage<M>;
@@ -293,39 +287,50 @@ pub fn uuid() -> String {
     hasher.result_str()
 }
 
+
+const APLN: &str = "quic-p2p-v2";
+
 /// 创建端点
 pub fn create_endpoint(addr: SocketAddr) -> Result<Endpoint, Report> {
-    let cert = CertificateDer::from_pem_file("./cert.pem").unwrap();
-    let key = PrivatePkcs8KeyDer::from_pem_file("./key.pem").unwrap();
+    // 生成临时证书用于建立连接（在P2P场景下，我们可能不需要正式的证书验证）
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_der = CertificateDer::from(cert.cert);
+    let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+
     // 配置服务器TLS
-    let server_config = rustls::ServerConfig::builder()
+    let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert.to_owned()], PrivateKeyDer::Pkcs8(key))?;
+        .with_single_cert(vec![cert_der.clone()], PrivateKeyDer::Pkcs8(key_der.clone_key()))?;
+
+    // 设置 ALPN 协议标识，用于标识我们的P2P应用
+    server_crypto.alpn_protocols = vec![APLN.into()];
 
     // 创建QUIC服务器配置
     let mut server_config =
-        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_config)?));
+        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
     // 启用QUIC keep-alive
     if let Some(transport_config) = Arc::get_mut(&mut server_config.transport) {
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
     }
 
-    // 验证服务器
-    let mut certs = RootCertStore::empty();
-    // 从文件读取pem转换为der
-    certs.add(cert)?;
-    let client_config = rustls::client::ClientConfig::builder()
-        .with_root_certificates(certs)
-        .with_no_client_auth();
+    // 配置客户端 - 跳过证书验证，但保留ALPN检查
+    let mut client_crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(SkipServerVerification::new())
+        .with_client_auth_cert(vec![cert_der], PrivateKeyDer::Pkcs8(key_der))?;
+
+    // 设置相同的ALPN协议
+    client_crypto.alpn_protocols = vec![APLN.into()];
 
     let mut endpoint = Endpoint::client(addr)?;
     endpoint.set_server_config(Some(server_config));
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(client_config)?,
+        QuicClientConfig::try_from(client_crypto)?,
     )));
 
     Ok(endpoint)
 }
+
 
 #[derive(Debug, Clone)]
 struct Parameters {
@@ -351,6 +356,9 @@ fn gen_interval(base: Duration) -> Duration {
     let jitter = rand::random::<u64>() % (millis / 10);
     base + Duration::from_millis(jitter)
 }
+
+
+
 
 #[cfg(test)]
 mod tests {
