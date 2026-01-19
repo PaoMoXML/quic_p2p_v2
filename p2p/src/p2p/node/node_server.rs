@@ -18,9 +18,12 @@ use tokio_util::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::p2p::node::{
-    message::{MessagePayload, P2pNodeProtocolMessage},
-    node_id::{LocalNodeId, NodeId},
+use crate::p2p::{
+    node::{
+        message::{MessagePayload, P2pNodeProtocolMessage},
+        node_id::{LocalNodeId, NodeId},
+    },
+    tls,
 };
 
 #[derive(Debug)]
@@ -219,10 +222,7 @@ impl<M: MessagePayload> ServerHandle<M> {
         // 如果没有现成的连接，创建一个新的
         let connection = self
             .endpoint
-            .connect(
-                addr,
-                &self.server_name, // 必须与证书中的域名匹配
-            )?
+            .connect(addr, &tls::name::encode(nodeid.local_id().public()))?
             .await
             .context(format!("连接到节点: {addr}出错"))?;
         info!("Connected to server: {:?}", connection.remote_address());

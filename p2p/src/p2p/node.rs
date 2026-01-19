@@ -1,11 +1,7 @@
-use std::{
-    net::SocketAddr,
-    sync::Arc,
-    task::Poll,
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, task::Poll, time::Duration};
 
 use crypto::{digest::Digest, sha2::Sha256};
+use ed25519_dalek::{SECRET_KEY_LENGTH, SigningKey};
 use futures::Stream;
 use plumtree::time::NodeTime;
 use quinn::{
@@ -21,12 +17,18 @@ use rustls::{
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tracing::{debug, info, warn};
 
-use crate::p2p::{node::{
-    message::{MessageId, MessagePayload, P2pNodeProtocolMessage},
-    misc::{HyparviewAction, HyparviewNode, PlumtreeAction, PlumtreeAppMessage, PlumtreeNode},
-    node_id::NodeId,
-    node_server::{NodeHandle, ServerHandle},
-}, server_verification::SkipServerVerification};
+use crate::p2p::{
+    node::{
+        message::{MessageId, MessagePayload, P2pNodeProtocolMessage},
+        misc::{HyparviewAction, HyparviewNode, PlumtreeAction, PlumtreeAppMessage, PlumtreeNode},
+        node_id::{NodeId, SecretKey},
+        node_server::{NodeHandle, ServerHandle},
+    },
+    tls::{
+        resolver::AlwaysResolvesCert,
+        verifier::{self, ClientCertificateVerifier, PROTOCOL_VERSIONS, ServerCertificateVerifier},
+    },
+};
 
 pub mod args;
 pub mod message;
@@ -238,7 +240,6 @@ impl<M: MessagePayload> P2PNode<M> {
     }
 }
 
-
 impl<M: MessagePayload> Stream for P2PNode<M> {
     type Item = PlumtreeAppMessage<M>;
 
@@ -248,10 +249,11 @@ impl<M: MessagePayload> Stream for P2PNode<M> {
     ) -> std::task::Poll<Option<Self::Item>> {
         let node = self.get_mut();
         if let Some(interval) = node.tick_interval.as_mut()
-            && interval.poll_tick(cx).is_ready() {
-                node.handle_tick();
-                cx.waker().wake_by_ref();
-            }
+            && interval.poll_tick(cx).is_ready()
+        {
+            node.handle_tick();
+            cx.waker().wake_by_ref();
+        }
 
         let mut did_something = true;
         while did_something {
@@ -287,24 +289,23 @@ pub fn uuid() -> String {
     hasher.result_str()
 }
 
-
-const APLN: &str = "quic-p2p-v2";
+const APLN: &[u8] = b"quic-p2p-v2";
 
 /// 创建端点
-pub fn create_endpoint(addr: SocketAddr) -> Result<Endpoint, Report> {
-    // 生成临时证书用于建立连接（在P2P场景下，我们可能不需要正式的证书验证）
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+pub fn create_endpoint(addr: SocketAddr, secret: &SecretKey) -> Result<Endpoint, Report> {
+    let client_verifier = ClientCertificateVerifier::new();
 
+    let resolver = Arc::new(AlwaysResolvesCert::new(secret)?);
     // 配置服务器TLS
-    let mut server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der.clone()], PrivateKeyDer::Pkcs8(key_der.clone_key()))?;
-
+    let mut server_crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(verifier::PROTOCOL_VERSIONS)
+    .expect("fixed config")
+    .with_client_cert_verifier(client_verifier)
+    .with_cert_resolver(resolver.clone());
     // 设置 ALPN 协议标识，用于标识我们的P2P应用
-    server_crypto.alpn_protocols = vec![APLN.into()];
-
+    server_crypto.alpn_protocols = vec![APLN.to_vec()];
     // 创建QUIC服务器配置
     let mut server_config =
         ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
@@ -313,14 +314,19 @@ pub fn create_endpoint(addr: SocketAddr) -> Result<Endpoint, Report> {
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
     }
 
+    let server_verifier = ServerCertificateVerifier::new();
     // 配置客户端 - 跳过证书验证，但保留ALPN检查
-    let mut client_crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(SkipServerVerification::new())
-        .with_client_auth_cert(vec![cert_der], PrivateKeyDer::Pkcs8(key_der))?;
+    let mut client_crypto = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(verifier::PROTOCOL_VERSIONS)
+    .expect("version supported by ring")
+    .dangerous()
+    .with_custom_certificate_verifier(server_verifier)
+    .with_client_cert_resolver(resolver);
 
     // 设置相同的ALPN协议
-    client_crypto.alpn_protocols = vec![APLN.into()];
+    client_crypto.alpn_protocols = vec![APLN.to_vec()];
 
     let mut endpoint = Endpoint::client(addr)?;
     endpoint.set_server_config(Some(server_config));
@@ -330,7 +336,6 @@ pub fn create_endpoint(addr: SocketAddr) -> Result<Endpoint, Report> {
 
     Ok(endpoint)
 }
-
 
 #[derive(Debug, Clone)]
 struct Parameters {
@@ -356,9 +361,6 @@ fn gen_interval(base: Duration) -> Duration {
     let jitter = rand::random::<u64>() % (millis / 10);
     base + Duration::from_millis(jitter)
 }
-
-
-
 
 #[cfg(test)]
 mod tests {

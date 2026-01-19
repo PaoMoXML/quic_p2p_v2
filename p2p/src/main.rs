@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use clap::Parser;
 use rootcause::Report;
 use tokio::sync::mpsc;
@@ -14,7 +16,7 @@ use crate::{
     p2p::node::{
         P2PNode,
         args::Args,
-        node_id::{LocalNodeId, NodeId},
+        node_id::{LocalNodeId, NodeId, PublicKey, SecretKey},
         node_server::P2PNodeServer,
         uuid,
     },
@@ -30,18 +32,20 @@ async fn main() -> Result<(), Report> {
         .with_line_number(true)
         .with_timer(time::LocalTime::rfc_3339())
         .with_ansi(true)
-        .with_writer(std::io::stderr.with_max_level(tracing::Level::DEBUG));
+        .with_writer(std::io::stderr.with_max_level(tracing::Level::INFO));
 
     tracing_subscriber::registry().with(stderr_layer).init();
 
-    rustls::crypto::aws_lc_rs::default_provider()
+    rustls::crypto::ring::default_provider()
         .install_default()
         .unwrap();
 
     let args = Args::parse();
     let addr = args.local_addr;
-    let endpoint = p2p::node::create_endpoint(addr)?;
-    let local_id = LocalNodeId::new(uuid());
+    let secret = SecretKey::generate();
+    let endpoint = p2p::node::create_endpoint(addr, &secret)?;
+
+    let local_id = LocalNodeId::new(secret.public());
     let node_id = NodeId::new(
         if args.public_addr.is_none() {
             endpoint.local_addr()?
@@ -50,11 +54,22 @@ async fn main() -> Result<(), Report> {
         },
         local_id.clone(),
     );
-    let server = P2PNodeServer::new(endpoint, args.server_name);
+
+    println!(
+        "cargo run -- -l={} --connect-to={} -s={}",
+        "192.168.178.223:8002",
+        args.local_addr.to_string(),
+        local_id.to_string()
+    );
+
+    let server = P2PNodeServer::new(endpoint, local_id.to_string());
     let mut p2pnode = P2PNode::<ChatMessage>::new(node_id, server.handle())?;
 
     if let Some(remote_addr) = args.connect_to {
-        p2pnode.join(NodeId::new(remote_addr, LocalNodeId::new(uuid())));
+        p2pnode.join(NodeId::new(
+            remote_addr,
+            LocalNodeId::new(PublicKey::from_str(&args.server_name)?),
+        ));
     }
 
     let (tx, rx) = mpsc::unbounded_channel();
