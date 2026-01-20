@@ -1,12 +1,10 @@
 use std::sync::Arc;
 
 use ed25519_dalek::{VerifyingKey, pkcs8::EncodePublicKey};
-use log::warn;
-use rcgen::Certificate;
 use rustls::{
-    CertificateError, SignatureScheme, SupportedProtocolVersion,
+    CertificateError, SupportedProtocolVersion,
     client::danger::ServerCertVerifier,
-    crypto::{WebPkiSupportedAlgorithms, verify_tls13_signature_with_raw_key},
+    crypto::verify_tls13_signature_with_raw_key,
     pki_types::SubjectPublicKeyInfoDer,
     server::danger::ClientCertVerifier,
 };

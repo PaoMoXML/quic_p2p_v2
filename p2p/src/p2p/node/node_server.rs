@@ -1,6 +1,6 @@
 use std::{
+    net::SocketAddr,
     sync::{Arc, RwLock},
-    task::Poll,
 };
 
 use dashmap::DashMap;
@@ -8,10 +8,7 @@ use futures::{SinkExt, StreamExt};
 use hyparview::message::{DisconnectMessage, ProtocolMessage};
 use quinn::{ApplicationClose, Connection, Endpoint};
 use rootcause::{Report, prelude::ResultExt};
-use tokio::sync::{
-    Mutex,
-    mpsc::{self, UnboundedReceiver, UnboundedSender},
-};
+use tokio::sync::{Mutex, mpsc::UnboundedSender};
 use tokio_util::{
     bytes::Bytes,
     codec::{FramedRead, FramedWrite, LengthDelimitedCodec},
@@ -21,27 +18,81 @@ use tracing::{debug, error, info, warn};
 use crate::p2p::{
     node::{
         message::{MessagePayload, P2pNodeProtocolMessage},
-        node_id::{LocalNodeId, NodeId},
+        node_id::{LocalNodeId, NodeId, SecretKey},
     },
-    tls,
+    tls::{self, TlsConfig},
 };
+#[derive(Debug, Default)]
+pub struct P2PNodeServerBuilder {
+    secret_key: Option<SecretKey>,
+    tls_config: Option<TlsConfig>,
+    alpn_protocols: Vec<Vec<u8>>,
+}
+
+impl P2PNodeServerBuilder {
+    pub fn secret_key(mut self, secret_key: SecretKey) -> Self {
+        self.secret_key.replace(secret_key);
+        self
+    }
+
+    pub fn tls_config(mut self, tls_config: TlsConfig) -> Self {
+        self.tls_config.replace(tls_config);
+        self
+    }
+
+    pub fn alpn_protocols(mut self, alpn_protocols: Vec<Vec<u8>>) -> Self {
+        self.alpn_protocols = alpn_protocols;
+        self
+    }
+
+    pub fn bind<M: MessagePayload>(self, addr: SocketAddr) -> Result<P2PNodeServer<M>, Report> {
+        let tls_config = if self.tls_config.is_none() {
+            TlsConfig::new(self.secret_key.expect("Secret Key is None"))
+        } else {
+            self.tls_config.unwrap()
+        };
+        let client_config = tls_config.make_client_config(self.alpn_protocols.clone())?;
+        let server_config = tls_config.make_server_config(self.alpn_protocols)?;
+        let mut endpoint = Endpoint::client(addr)?;
+        endpoint.set_server_config(Some(server_config));
+        endpoint.set_default_client_config(client_config);
+
+        let handle = ServerHandle {
+            endpoint,
+            local_nodes: Arc::new(RwLock::new(None)),
+            remote_nodes: Arc::new(DashMap::new()),
+            connection_locks: Arc::new(DashMap::new()),
+        };
+
+        Ok(P2PNodeServer {
+            tls_config,
+            server_is_running: false,
+            handle,
+        })
+    }
+}
 
 #[derive(Debug)]
 pub struct P2PNodeServer<M: MessagePayload> {
+    tls_config: TlsConfig,
     server_is_running: bool,
     handle: ServerHandle<M>,
 }
 
 impl<M: MessagePayload> P2PNodeServer<M> {
-    pub fn new(endpoint: Endpoint, server_name: String) -> Self {
+    pub fn builder() -> P2PNodeServerBuilder {
+        P2PNodeServerBuilder::default()
+    }
+
+    pub fn new(endpoint: Endpoint, secret_key: SecretKey) -> Self {
         let handle = ServerHandle {
-            server_name,
             endpoint,
             local_nodes: Arc::new(RwLock::new(None)),
             remote_nodes: Arc::new(DashMap::new()),
             connection_locks: Arc::new(DashMap::new()),
         };
         P2PNodeServer {
+            tls_config: TlsConfig::new(secret_key),
             server_is_running: false,
             handle,
         }
@@ -49,6 +100,10 @@ impl<M: MessagePayload> P2PNodeServer<M> {
 
     pub fn handle(&self) -> ServerHandle<M> {
         self.handle.clone()
+    }
+
+    pub fn get_local_ip(&self) -> Result<SocketAddr, Report> {
+        Ok(self.handle.endpoint.local_addr()?)
     }
 }
 
@@ -76,7 +131,6 @@ impl<M: MessagePayload> Future for P2PNodeServer<M> {
 
 #[derive(Debug, Clone)]
 pub struct ServerHandle<M: MessagePayload> {
-    server_name: String,
     endpoint: Endpoint,
     local_nodes: Arc<RwLock<Option<(LocalNodeId, NodeHandle<M>)>>>,
     remote_nodes: Arc<DashMap<LocalNodeId, Connection>>,
@@ -152,10 +206,10 @@ impl<M: MessagePayload> ServerHandle<M> {
                                 connection_id = Some(node_id);
                             }
 
-                            if let Ok(read) = self.local_nodes.read() {
-                                if let Some((_id, node)) = read.as_ref() {
-                                    node.message_tx.send(p2p_node_protocol_message)?;
-                                }
+                            if let Ok(read) = self.local_nodes.read()
+                                && let Some((_id, node)) = read.as_ref()
+                            {
+                                node.message_tx.send(p2p_node_protocol_message)?;
                             }
                         }
                     }
@@ -190,7 +244,7 @@ impl<M: MessagePayload> ServerHandle<M> {
     /// 注册本地的节点
     pub(crate) fn register_local_node(&self, node: NodeHandle<M>) {
         if let Ok(mut write) = self.local_nodes.write() {
-            write.replace((node.local_id.clone(), node));
+            write.replace((node.local_id, node));
         }
     }
 
@@ -208,7 +262,7 @@ impl<M: MessagePayload> ServerHandle<M> {
 
         let lock = self
             .connection_locks
-            .entry(nodeid.local_id().clone())
+            .entry(*nodeid.local_id())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
 
@@ -229,7 +283,7 @@ impl<M: MessagePayload> ServerHandle<M> {
 
         // 将连接存入缓存
         self.remote_nodes
-            .insert(nodeid.local_id().clone(), connection.clone());
+            .insert(*nodeid.local_id(), connection.clone());
 
         Ok(connection)
     }
@@ -296,10 +350,10 @@ impl<M: MessagePayload> ServerHandle<M> {
         };
         let message = ProtocolMessage::Disconnect(message);
         let message = P2pNodeProtocolMessage::Hyparview(message);
-        if let Ok(read) = self.local_nodes.read() {
-            if let Some((_id, node)) = read.as_ref() {
-                let _ = node.message_tx.send(message);
-            }
+        if let Ok(read) = self.local_nodes.read()
+            && let Some((_id, node)) = read.as_ref()
+        {
+            let _ = node.message_tx.send(message);
         }
         self.remove_remote_node(destination.local_id());
     }

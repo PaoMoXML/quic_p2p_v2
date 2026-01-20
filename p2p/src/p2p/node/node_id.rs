@@ -5,7 +5,7 @@ use std::{
     str::FromStr,
 };
 
-use data_encoding::{DecodeError, DecodePartial};
+use data_encoding::DecodeError;
 use ed25519_dalek::{
     PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, Signature, SignatureError, SigningKey, VerifyingKey,
 };
@@ -90,16 +90,14 @@ impl FromStr for PublicKey {
         match data_encoding::HEXLOWER.decode_mut(s.as_bytes(), &mut bytes) {
             Ok(_) => {}
             Err(err) => {
-                return Err(KeyParsingError::DecodeError {
-                    err: err.error.into(),
-                });
+                return Err(KeyParsingError::DecodeError { err: err.error });
             }
         };
         Ok(Self::try_from(&bytes)?)
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SecretKey(SigningKey);
 impl SecretKey {
     pub fn public(&self) -> PublicKey {
@@ -130,7 +128,7 @@ impl LocalNodeId {
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0.as_bytes()
+        self.0.as_bytes()
     }
 
     pub fn short(&self) -> String {

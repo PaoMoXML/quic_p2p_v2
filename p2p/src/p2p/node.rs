@@ -1,7 +1,6 @@
 use std::{net::SocketAddr, sync::Arc, task::Poll, time::Duration};
 
 use crypto::{digest::Digest, sha2::Sha256};
-use ed25519_dalek::{SECRET_KEY_LENGTH, SigningKey};
 use futures::Stream;
 use plumtree::time::NodeTime;
 use quinn::{
@@ -10,10 +9,6 @@ use quinn::{
 };
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rootcause::Report;
-use rustls::{
-    RootCertStore,
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject},
-};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tracing::{debug, info, warn};
 
@@ -25,8 +20,9 @@ use crate::p2p::{
         node_server::{NodeHandle, ServerHandle},
     },
     tls::{
+        TlsConfig,
         resolver::AlwaysResolvesCert,
-        verifier::{self, ClientCertificateVerifier, PROTOCOL_VERSIONS, ServerCertificateVerifier},
+        verifier::{self, ClientCertificateVerifier, ServerCertificateVerifier},
     },
 };
 
@@ -55,7 +51,7 @@ pub struct P2PNode<M: MessagePayload> {
 impl<M: MessagePayload> P2PNode<M> {
     pub fn new(node_id: NodeId, server: ServerHandle<M>) -> Result<Self, Report> {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
-        let node_handle = NodeHandle::new(node_id.local_id().clone(), message_tx);
+        let node_handle = NodeHandle::new(*node_id.local_id(), message_tx);
         server.register_local_node(node_handle);
         let plumtree_node = plumtree::Node::new(node_id.clone());
         let now = plumtree_node.clock().now();

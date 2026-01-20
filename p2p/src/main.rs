@@ -1,10 +1,13 @@
-use std::str::FromStr;
+use std::{
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    str::FromStr,
+};
 
 use clap::Parser;
 use rootcause::Report;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug_span, warn};
+use tracing::warn;
 use tracing_subscriber::{
     fmt::{time, writer::MakeWriterExt},
     layer::SubscriberExt,
@@ -18,12 +21,13 @@ use crate::{
         args::Args,
         node_id::{LocalNodeId, NodeId, PublicKey, SecretKey},
         node_server::P2PNodeServer,
-        uuid,
     },
 };
 
 mod chat;
 mod p2p;
+
+const APLN: &[u8] = b"quic-p2p-v2";
 
 #[tokio::main]
 async fn main() -> Result<(), Report> {
@@ -39,36 +43,39 @@ async fn main() -> Result<(), Report> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .unwrap();
-
+    
     let args = Args::parse();
-    let addr = args.local_addr;
+    let local_ip = get_local_ip()?;
+    let addr = SocketAddr::new(local_ip, 0);
     let secret = SecretKey::generate();
-    let endpoint = p2p::node::create_endpoint(addr, &secret)?;
 
     let local_id = LocalNodeId::new(secret.public());
+
+    let server = P2PNodeServer::<ChatMessage>::builder()
+        .secret_key(secret)
+        .alpn_protocols(vec![APLN.to_vec()])
+        .bind(addr.into())?;
+
+    println!(
+        "cargo run --  --connect-to={} -s={}",
+        server.get_local_ip()?,
+        local_id
+    );
+
     let node_id = NodeId::new(
         if args.public_addr.is_none() {
-            endpoint.local_addr()?
+            server.get_local_ip()?
         } else {
             args.public_addr.unwrap()
         },
-        local_id.clone(),
+        local_id,
     );
 
-    println!(
-        "cargo run -- -l={} --connect-to={} -s={}",
-        "192.168.178.223:8002",
-        args.local_addr.to_string(),
-        local_id.to_string()
-    );
-
-    let server = P2PNodeServer::new(endpoint, local_id.to_string());
     let mut p2pnode = P2PNode::<ChatMessage>::new(node_id, server.handle())?;
-
     if let Some(remote_addr) = args.connect_to {
         p2pnode.join(NodeId::new(
             remote_addr,
-            LocalNodeId::new(PublicKey::from_str(&args.server_name)?),
+            LocalNodeId::new(PublicKey::from_str(&args.server_name.unwrap())?),
         ));
     }
 
@@ -89,7 +96,7 @@ async fn main() -> Result<(), Report> {
         let mut line = String::new();
 
         loop {
-            let user = local_id.clone();
+            let user = local_id;
             line.clear();
             match reader.read_line(&mut line).await {
                 Ok(0) => break, // EOF
@@ -115,4 +122,14 @@ async fn main() -> Result<(), Report> {
     token.cancelled().await;
     handle.stop_server().await?;
     Ok(())
+}
+
+// 新增函数：获取本机真实IP地址
+fn get_local_ip() -> Result<std::net::IpAddr, Report> {
+    // 创建一个UDP socket连接到一个远程地址，然后获取本地地址
+    // 这个方法可以获取到实际使用的网络接口的IP地址
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("8.8.8.8:80")?; // 连接到Google DNS服务器
+    let local_addr = socket.local_addr()?;
+    Ok(local_addr.ip())
 }

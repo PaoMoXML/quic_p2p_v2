@@ -1,6 +1,6 @@
 use data_encoding::BASE32_DNSSEC;
 use ed25519_dalek::VerifyingKey;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::p2p::node::node_id::PublicKey;
 
@@ -27,8 +27,6 @@ mod tests {
     use rootcause::Report;
     #[test]
     fn test_sign() -> Result<(), Report> {
-        let msg = "hello world".as_bytes();
-        let msg2 = "hello world2".as_bytes();
 
         let mut secret_key_bytes: [u8; SECRET_KEY_LENGTH] = [0; SECRET_KEY_LENGTH];
         let mut rng = rand::rng();

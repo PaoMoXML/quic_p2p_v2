@@ -5,7 +5,6 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::debug_span;
 
 use crate::p2p::node::{P2PNode, message::MessagePayload, node_id::LocalNodeId};
 
