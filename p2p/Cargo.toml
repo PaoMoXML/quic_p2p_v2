@@ -36,7 +36,8 @@ ed25519-dalek = { version = "2.2.0", features = ["pkcs8", "serde", "pem"] }
 data-encoding = "2.10.0"
 thiserror = "2.0.18"
 # rand_core = "0.9.5"
-# stun_codec ={ version = "0.4"}
+stun_codec ={ version = "0.4"}
+bytecodec = "0.5.0"
 
 
 [features]

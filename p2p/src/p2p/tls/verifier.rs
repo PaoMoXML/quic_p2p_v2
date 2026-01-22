@@ -2,10 +2,8 @@ use std::sync::Arc;
 
 use ed25519_dalek::{VerifyingKey, pkcs8::EncodePublicKey};
 use rustls::{
-    CertificateError, SupportedProtocolVersion,
-    client::danger::ServerCertVerifier,
-    crypto::verify_tls13_signature_with_raw_key,
-    pki_types::SubjectPublicKeyInfoDer,
+    CertificateError, SupportedProtocolVersion, client::danger::ServerCertVerifier,
+    crypto::verify_tls13_signature_with_raw_key, pki_types::SubjectPublicKeyInfoDer,
     server::danger::ClientCertVerifier,
 };
 pub static PROTOCOL_VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
@@ -95,7 +93,7 @@ impl ServerCertVerifier for ServerCertificateVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
-    
+
     fn requires_raw_public_keys(&self) -> bool {
         true
     }
@@ -103,12 +101,6 @@ impl ServerCertVerifier for ServerCertificateVerifier {
 
 #[derive(Default, Debug)]
 pub struct ClientCertificateVerifier;
-
-impl ClientCertificateVerifier {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self)
-    }
-}
 
 /// We requires either following of X.509 client certificate chains:
 ///

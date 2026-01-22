@@ -285,54 +285,6 @@ pub fn uuid() -> String {
     hasher.result_str()
 }
 
-const APLN: &[u8] = b"quic-p2p-v2";
-
-/// 创建端点
-pub fn create_endpoint(addr: SocketAddr, secret: &SecretKey) -> Result<Endpoint, Report> {
-    let client_verifier = ClientCertificateVerifier::new();
-
-    let resolver = Arc::new(AlwaysResolvesCert::new(secret)?);
-    // 配置服务器TLS
-    let mut server_crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(verifier::PROTOCOL_VERSIONS)
-    .expect("fixed config")
-    .with_client_cert_verifier(client_verifier)
-    .with_cert_resolver(resolver.clone());
-    // 设置 ALPN 协议标识，用于标识我们的P2P应用
-    server_crypto.alpn_protocols = vec![APLN.to_vec()];
-    // 创建QUIC服务器配置
-    let mut server_config =
-        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    // 启用QUIC keep-alive
-    if let Some(transport_config) = Arc::get_mut(&mut server_config.transport) {
-        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
-    }
-
-    let server_verifier = ServerCertificateVerifier::new();
-    // 配置客户端 - 跳过证书验证，但保留ALPN检查
-    let mut client_crypto = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(verifier::PROTOCOL_VERSIONS)
-    .expect("version supported by ring")
-    .dangerous()
-    .with_custom_certificate_verifier(server_verifier)
-    .with_client_cert_resolver(resolver);
-
-    // 设置相同的ALPN协议
-    client_crypto.alpn_protocols = vec![APLN.to_vec()];
-
-    let mut endpoint = Endpoint::client(addr)?;
-    endpoint.set_server_config(Some(server_config));
-    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(client_crypto)?,
-    )));
-
-    Ok(endpoint)
-}
-
 #[derive(Debug, Clone)]
 struct Parameters {
     tick_interval: Duration,

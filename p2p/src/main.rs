@@ -43,11 +43,12 @@ async fn main() -> Result<(), Report> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .unwrap();
-    
+
     let args = Args::parse();
     let local_ip = get_local_ip()?;
     let addr = SocketAddr::new(local_ip, 0);
     let secret = SecretKey::generate();
+    let ip = p2p::net::stun_ip().await?;
 
     let local_id = LocalNodeId::new(secret.public());
 
@@ -57,7 +58,7 @@ async fn main() -> Result<(), Report> {
         .bind(addr.into())?;
 
     println!(
-        "cargo run --  --connect-to={} -s={}",
+        "cargo run -- --connect-to={} -s={}",
         server.get_local_ip()?,
         local_id
     );

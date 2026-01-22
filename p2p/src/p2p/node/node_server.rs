@@ -46,17 +46,16 @@ impl P2PNodeServerBuilder {
     }
 
     pub fn bind<M: MessagePayload>(self, addr: SocketAddr) -> Result<P2PNodeServer<M>, Report> {
-        let tls_config = if self.tls_config.is_none() {
-            TlsConfig::new(self.secret_key.expect("Secret Key is None"))
-        } else {
-            self.tls_config.unwrap()
+        let tls_config = match self.tls_config {
+            Some(tls_config) => tls_config,
+            None => TlsConfig::new(self.secret_key.expect("Secret Key is None")),
         };
         let client_config = tls_config.make_client_config(self.alpn_protocols.clone())?;
         let server_config = tls_config.make_server_config(self.alpn_protocols)?;
         let mut endpoint = Endpoint::client(addr)?;
         endpoint.set_server_config(Some(server_config));
         endpoint.set_default_client_config(client_config);
-
+        
         let handle = ServerHandle {
             endpoint,
             local_nodes: Arc::new(RwLock::new(None)),
