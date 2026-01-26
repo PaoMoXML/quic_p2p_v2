@@ -228,10 +228,10 @@ impl<M: MessagePayload> P2PNode<M> {
             };
             let message = ProtocolMessage::Disconnect(message);
             let message = P2pNodeProtocolMessage::Hyparview(message);
-            self.server.notify_self_disconnect(&peer);
-            if let Err(e) = self.server.send_protocol_message(peer, message) {
+            if let Err(e) = self.server.send_protocol_message(&peer, message) {
                 warn!("Leave err: {e}");
             }
+            self.server.notify_self_disconnect(&peer);
         }
     }
 }

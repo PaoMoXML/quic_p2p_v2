@@ -1,11 +1,19 @@
 use bytecodec::{DecodeExt, EncodeExt};
+use quinn::EndpointConfig;
 use rootcause::{IntoReport, Report};
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+use std::net::SocketAddrV4;
 use std::net::ToSocketAddrs;
+use std::net::UdpSocket;
+use std::sync::Arc;
 use std::time::Duration;
 use stun_codec::rfc5389::Attribute;
 use stun_codec::{Message, MessageClass, MessageEncoder, rfc5389};
 use stun_codec::{TransactionId, rfc5389::methods};
-use tokio::net::UdpSocket;
+use tracing::debug;
+
+pub struct Endpoint {}
 
 pub const PUB_STUN: [&'static str; 4] = [
     "stun.chat.bilibili.com:3478",
@@ -13,16 +21,31 @@ pub const PUB_STUN: [&'static str; 4] = [
     "stun.hitv.com:3478",
     "stun.cdnbye.com:3478",
 ];
+pub async fn create_endpoint(
+    addr: Option<SocketAddr>,
+) -> Result<(quinn::Endpoint, SocketAddr), Report> {
+    let bind_addr = addr.unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into());
+    let socket = UdpSocket::bind(bind_addr)?;
+    let socket_cloned = socket.try_clone()?;
+    let ip = stun_addr(&socket_cloned).await;
+
+    let mut endpoint_config = EndpointConfig::default();
+    // 不接收0开头的数据包
+    endpoint_config.grease_quic_bit(false);
+
+    let endpoint =
+        quinn::Endpoint::new(endpoint_config, None, socket, Arc::new(quinn::TokioRuntime))?;
+    debug!("endpoint addr: {:?}", endpoint.local_addr());
+    Ok((endpoint, ip?))
+}
 
 // 使用STUN协议获取公网IP地址
-pub async fn stun_ip() -> Result<std::net::IpAddr, Report> {
-    // 创建UDP套接字
-    let socket = UdpSocket::bind("0.0.0.0:15004").await?;
+pub async fn stun_addr(socket: &UdpSocket) -> Result<std::net::SocketAddr, Report> {
     // 尝试连接到可用的STUN服务器
     let mut last_err = None;
 
     for &server_addr in PUB_STUN.iter() {
-        match get_external_ip_from_stun(&socket, server_addr).await {
+        match get_external_ip_from_stun(socket, server_addr).await {
             Ok(ip) => return Ok(ip),
             Err(e) => {
                 last_err = Some(e);
@@ -44,7 +67,7 @@ pub async fn stun_ip() -> Result<std::net::IpAddr, Report> {
 async fn get_external_ip_from_stun(
     socket: &UdpSocket,
     server_addr: &str,
-) -> Result<std::net::IpAddr, Report> {
+) -> Result<std::net::SocketAddr, Report> {
     // 解析STUN服务器地址
     let addr = server_addr
         .to_socket_addrs()
@@ -77,21 +100,11 @@ async fn get_external_ip_from_stun(
     let buffer = encoder.encode_into_bytes(request)?;
 
     // 发送STUN请求
-    socket
-        .send_to(&buffer, addr)
-        .await
-        .map_err(|e| e.into_report())?;
+    socket.send_to(&buffer, addr).map_err(|e| e.into_report())?;
 
     // 接收STUN响应
     let mut response_buffer = vec![0; 1024];
-    let (len, _) = tokio::time::timeout(
-        Duration::from_secs(5),
-        socket.recv_from(&mut response_buffer),
-    )
-    .await
-    .map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, "STUN request timed out").into_report()
-    })??;
+    let (len, _) = socket.recv_from(&mut response_buffer)?;
 
     // 解码响应
     let mut decoder = stun_codec::MessageDecoder::<Attribute>::new();
@@ -109,15 +122,14 @@ async fn get_external_ip_from_stun(
             // 查找 XOR_MAPPED_ADDRESS 属性
             for attr in response.attributes() {
                 if let Attribute::XorMappedAddress(address) = attr {
-                    dbg!(address.address());
-                    return Ok(address.address().ip());
+                    return Ok(address.address());
                 }
             }
 
             // 如果没有找到 XOR_MAPPED_ADDRESS，尝试 MAPPED_ADDRESS
             for attr in response.attributes() {
                 if let Attribute::MappedAddress(address) = attr {
-                    return Ok(address.address().ip());
+                    return Ok(address.address());
                 }
             }
         }
@@ -130,8 +142,32 @@ async fn get_external_ip_from_stun(
     )))
 }
 
-#[tokio::test]
-async fn test_get_local_ip() {
-    let result = stun_ip().await;
-    dbg!(result);
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+
+    use tracing::info;
+    use tracing_subscriber::{
+        fmt::{time, writer::MakeWriterExt},
+        layer::SubscriberExt,
+        util::SubscriberInitExt,
+    };
+
+    use crate::p2p::net::{create_endpoint, stun_addr};
+
+    #[tokio::test]
+    async fn test_get_local_ip() {
+        let stderr_layer = tracing_subscriber::fmt::layer()
+            .with_file(true)
+            .with_line_number(true)
+            .with_timer(time::LocalTime::rfc_3339())
+            .with_ansi(true)
+            .with_writer(std::io::stderr.with_max_level(tracing::Level::DEBUG));
+
+        tracing_subscriber::registry().with(stderr_layer).init();
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+        let socket = UdpSocket::bind(bind_addr).unwrap();
+        let ip = stun_addr(&socket).await;
+        info!(ip=?ip);
+    }
 }

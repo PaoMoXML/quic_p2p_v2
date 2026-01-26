@@ -163,19 +163,22 @@ impl Display for LocalNodeId {
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeId {
-    address: SocketAddr,
+    addresses: Vec<SocketAddr>,
     local_id: LocalNodeId,
 }
 
 impl NodeId {
     /// Makes a new `NodeId` instance.
-    pub fn new(address: SocketAddr, local_id: LocalNodeId) -> Self {
-        NodeId { address, local_id }
+    pub fn new(addresses: Vec<SocketAddr>, local_id: LocalNodeId) -> Self {
+        NodeId {
+            addresses,
+            local_id,
+        }
     }
 
     /// Returns the RPC server address part of the identifier.
-    pub fn address(&self) -> SocketAddr {
-        self.address
+    pub fn address(&self) -> &Vec<SocketAddr> {
+        &self.addresses
     }
 
     /// Returns the local node identifier part of the identifier.

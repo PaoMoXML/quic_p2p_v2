@@ -45,31 +45,25 @@ async fn main() -> Result<(), Report> {
         .unwrap();
 
     let args = Args::parse();
-    let local_ip = get_local_ip()?;
-    let addr = SocketAddr::new(local_ip, 0);
     let secret = SecretKey::generate();
-    let ip = p2p::net::stun_ip().await?;
-
     let local_id = LocalNodeId::new(secret.public());
 
     let server = P2PNodeServer::<ChatMessage>::builder()
         .secret_key(secret)
         .alpn_protocols(vec![APLN.to_vec()])
-        .bind(addr.into())?;
+        .bind(args.local_addr)
+        .await?;
+    let node_id = NodeId::new(server.get_addresses().iter().cloned().collect(), local_id);
 
     println!(
-        "cargo run -- --connect-to={} -s={}",
-        server.get_local_ip()?,
+        "cargo run -- --connect-to={:?} -s={}",
+        node_id
+            .address()
+            .iter()
+            .map(|addr| addr.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
         local_id
-    );
-
-    let node_id = NodeId::new(
-        if args.public_addr.is_none() {
-            server.get_local_ip()?
-        } else {
-            args.public_addr.unwrap()
-        },
-        local_id,
     );
 
     let mut p2pnode = P2PNode::<ChatMessage>::new(node_id, server.handle())?;
@@ -123,14 +117,4 @@ async fn main() -> Result<(), Report> {
     token.cancelled().await;
     handle.stop_server().await?;
     Ok(())
-}
-
-// 新增函数：获取本机真实IP地址
-fn get_local_ip() -> Result<std::net::IpAddr, Report> {
-    // 创建一个UDP socket连接到一个远程地址，然后获取本地地址
-    // 这个方法可以获取到实际使用的网络接口的IP地址
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect("8.8.8.8:80")?; // 连接到Google DNS服务器
-    let local_addr = socket.local_addr()?;
-    Ok(local_addr.ip())
 }

@@ -8,12 +8,9 @@ pub struct Args {
     /// 启动地址
     #[arg(short = 'l', long, default_value = None)]
     pub local_addr: Option<SocketAddr>,
-    /// 公网地址
-    #[arg(short = 'p', long, default_value = None)]
-    pub public_addr: Option<SocketAddr>,
     /// 连接到的远程地址
-    #[arg(long, default_value = None, requires = "server_name")]
-    pub connect_to: Option<SocketAddr>,
+    #[arg(long, default_value = None, requires = "server_name", value_parser, num_args = 1.., value_delimiter = ' ')]
+    pub connect_to: Option<Vec<SocketAddr>>,
     /// 服务名
     #[arg(short = 's', long, default_value = None)]
     pub server_name: Option<String>,

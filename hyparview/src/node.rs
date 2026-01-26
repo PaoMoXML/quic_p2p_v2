@@ -150,11 +150,12 @@ where
     /// This method should be invoked periodically to keep the active view full.
     pub fn fill_active_view(&mut self) {
         if !self.is_active_view_full()
-            && let Some(node) = self.select_random_from_passive_view() {
-                let high_priority = self.active_view.is_empty();
-                let message = ProtocolMessage::neighbor(&self.id, high_priority);
-                send(&mut self.actions, node, message);
-            }
+            && let Some(node) = self.select_random_from_passive_view()
+        {
+            let high_priority = self.active_view.is_empty();
+            let message = ProtocolMessage::neighbor(&self.id, high_priority);
+            send(&mut self.actions, node, message);
+        }
     }
 
     /// Sends `NEIGHBOR` message to the members of the active view for
@@ -242,7 +243,7 @@ where
     }
 
     fn handle_disconnect(&mut self, m: DisconnectMessage<T>) {
-        if self.remove_from_active_view(&m.sender) {
+        if self.remove_from_active_view(&m) {
             self.remove_from_passive_view(&m.sender);
             self.fill_active_view();
         }
@@ -281,23 +282,27 @@ where
         self.passive_view.push(node);
     }
 
-    fn remove_from_active_view(&mut self, node: &T) -> bool {
+    fn remove_from_active_view(&mut self, m: &DisconnectMessage<T>) -> bool {
+        let node = &m.sender;
         let index = self.active_view.iter().position(|n| n == node);
         if let Some(i) = index {
-            self.remove_from_active_view_by_index(i);
+            self.remove_from_active_view_by_index(i, m.alive);
             true
         } else {
             false
         }
     }
 
-    fn remove_from_active_view_by_index(&mut self, i: usize) {
+    fn remove_from_active_view_by_index(&mut self, i: usize, alive: bool) {
         let node = self.active_view.swap_remove(i);
-        send(
-            &mut self.actions,
-            node.clone(),
-            ProtocolMessage::disconnect(&self.id, true),
-        );
+        // if the node is not alive, there is no need to send messages
+        if alive {
+            send(
+                &mut self.actions,
+                node.clone(),
+                ProtocolMessage::disconnect(&self.id, true),
+            );
+        }
         self.actions.push_back(Action::disconnect(node.clone()));
         self.actions.push_back(Action::notify_down(node.clone()));
         self.add_to_passive_view(node);
@@ -306,7 +311,7 @@ where
     fn remove_random_from_active_view_if_full(&mut self) {
         if self.is_active_view_full() {
             let i = self.rng.random_range(0..self.active_view.len());
-            self.remove_from_active_view_by_index(i);
+            self.remove_from_active_view_by_index(i, true);
         }
     }
 

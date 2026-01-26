@@ -1,13 +1,15 @@
 use std::{
-    net::SocketAddr,
+    collections::HashSet,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use hyparview::message::{DisconnectMessage, ProtocolMessage};
 use quinn::{ApplicationClose, Connection, Endpoint};
-use rootcause::{Report, prelude::ResultExt};
+use rootcause::Report;
 use tokio::sync::{Mutex, mpsc::UnboundedSender};
 use tokio_util::{
     bytes::Bytes,
@@ -16,6 +18,7 @@ use tokio_util::{
 use tracing::{debug, error, info, warn};
 
 use crate::p2p::{
+    net::create_endpoint,
     node::{
         message::{MessagePayload, P2pNodeProtocolMessage},
         node_id::{LocalNodeId, NodeId, SecretKey},
@@ -45,25 +48,36 @@ impl P2PNodeServerBuilder {
         self
     }
 
-    pub fn bind<M: MessagePayload>(self, addr: SocketAddr) -> Result<P2PNodeServer<M>, Report> {
+    pub async fn bind<M: MessagePayload>(
+        self,
+        addr: Option<SocketAddr>,
+    ) -> Result<P2PNodeServer<M>, Report> {
         let tls_config = match self.tls_config {
             Some(tls_config) => tls_config,
             None => TlsConfig::new(self.secret_key.expect("Secret Key is None")),
         };
         let client_config = tls_config.make_client_config(self.alpn_protocols.clone())?;
         let server_config = tls_config.make_server_config(self.alpn_protocols)?;
-        let mut endpoint = Endpoint::client(addr)?;
+        // let mut endpoint = Endpoint::client(addr)?;
+        let (mut endpoint, stun_addr) = create_endpoint(addr).await?;
         endpoint.set_server_config(Some(server_config));
         endpoint.set_default_client_config(client_config);
-        
+
         let handle = ServerHandle {
             endpoint,
             local_nodes: Arc::new(RwLock::new(None)),
             remote_nodes: Arc::new(DashMap::new()),
             connection_locks: Arc::new(DashMap::new()),
         };
-
+        let local_ip = get_local_ip()?;
+        let mut hash_set = HashSet::new();
+        hash_set.insert(stun_addr);
+        hash_set.insert(SocketAddr::new(
+            local_ip,
+            handle.endpoint.local_addr()?.port(),
+        ));
         Ok(P2PNodeServer {
+            addresses: hash_set,
             tls_config,
             server_is_running: false,
             handle,
@@ -73,9 +87,19 @@ impl P2PNodeServerBuilder {
 
 #[derive(Debug)]
 pub struct P2PNodeServer<M: MessagePayload> {
+    addresses: HashSet<SocketAddr>,
     tls_config: TlsConfig,
     server_is_running: bool,
     handle: ServerHandle<M>,
+}
+
+fn get_local_ip() -> Result<IpAddr, Report> {
+    // 创建一个UDP socket连接到一个远程地址，然后获取本地地址
+    // 这个方法可以获取到实际使用的网络接口的IP地址
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("8.8.8.8:80")?; // 连接到Google DNS服务器
+    let local_addr = socket.local_addr()?;
+    Ok(local_addr.ip())
 }
 
 impl<M: MessagePayload> P2PNodeServer<M> {
@@ -83,26 +107,12 @@ impl<M: MessagePayload> P2PNodeServer<M> {
         P2PNodeServerBuilder::default()
     }
 
-    pub fn new(endpoint: Endpoint, secret_key: SecretKey) -> Self {
-        let handle = ServerHandle {
-            endpoint,
-            local_nodes: Arc::new(RwLock::new(None)),
-            remote_nodes: Arc::new(DashMap::new()),
-            connection_locks: Arc::new(DashMap::new()),
-        };
-        P2PNodeServer {
-            tls_config: TlsConfig::new(secret_key),
-            server_is_running: false,
-            handle,
-        }
-    }
-
     pub fn handle(&self) -> ServerHandle<M> {
         self.handle.clone()
     }
 
-    pub fn get_local_ip(&self) -> Result<SocketAddr, Report> {
-        Ok(self.handle.endpoint.local_addr()?)
+    pub fn get_addresses(&self) -> &HashSet<SocketAddr> {
+        &self.addresses
     }
 }
 
@@ -138,8 +148,9 @@ pub struct ServerHandle<M: MessagePayload> {
 
 impl<M: MessagePayload> ServerHandle<M> {
     /// 启动quic客户端
-    #[tracing::instrument(skip_all, fields(local_addr=%self.endpoint.local_addr().expect("never fails").to_string()))]
+    // #[tracing::instrument(skip_all, fields(local_addr=%*self.local_nodes.read().as_ref().unwrap().unwrap().0.to_string()))]
     pub async fn start_server(&self) -> Result<(), Report> {
+        // info!("Local ips: {:?}",self.local_nodes.read().unwrap());
         info!("Server listen on: {}", self.endpoint.local_addr()?);
         // 接受传入连接
         loop {
@@ -169,7 +180,7 @@ impl<M: MessagePayload> ServerHandle<M> {
     }
 
     /// 监听连接
-    #[tracing::instrument(skip_all, fields(sender, remote_addr=conn.remote_address().to_string()))]
+    #[tracing::instrument(skip_all, fields(me = self.get_local_nodeid().expect("never fails").short(), remote))]
     async fn handle_connection(&self, conn: Connection) {
         let addr = conn.remote_address();
         let mut connection_id = None;
@@ -194,11 +205,11 @@ impl<M: MessagePayload> ServerHandle<M> {
                                 };
                                 debug!("Handle a connection from: {node_id:?}");
                                 tracing::Span::current().record(
-                                    "sender",
+                                    "remote",
                                     format!(
-                                        "NodeId ( address: {}, local_id: {} )",
+                                        "NodeId ( address: {:?}, local_id: {} )",
                                         node_id.address(),
-                                        node_id.local_id()
+                                        node_id.local_id().short()
                                     ),
                                 );
                                 // self.set_connection(&node_id, conn.clone()).await;
@@ -251,9 +262,18 @@ impl<M: MessagePayload> ServerHandle<M> {
         self.remote_nodes.remove(node);
     }
 
-    async fn get_connection(&self, nodeid: &NodeId) -> Result<Connection, Report> {
-        let addr = nodeid.address();
+    pub fn get_local_nodeid(&self) -> Option<LocalNodeId> {
+        if let Ok(read) = self.local_nodes.read()
+            && let Some((id, _node)) = read.as_ref()
+        {
+            Some(id.clone())
+        } else {
+            None
+        }
+    }
 
+    #[tracing::instrument(skip_all, fields(me = self.get_local_nodeid().expect("never fails").short(), remote))]
+    async fn get_connection(&self, nodeid: &NodeId) -> Result<Connection, Report> {
         // 首先检查是否已存在连接
         if let Some(conn) = self.remote_nodes.get(nodeid.local_id()) {
             return Ok(conn.clone());
@@ -273,18 +293,45 @@ impl<M: MessagePayload> ServerHandle<M> {
         }
 
         // 如果没有现成的连接，创建一个新的
-        let connection = self
-            .endpoint
-            .connect(addr, &tls::name::encode(nodeid.local_id().public()))?
+        let addrs = nodeid.address();
+        let mut connection = None;
+        for addr in addrs {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.endpoint
+                    .connect(*addr, &tls::name::encode(nodeid.local_id().public()))?,
+            )
             .await
-            .context(format!("连接到节点: {addr}出错"))?;
-        info!("Connected to server: {:?}", connection.remote_address());
+            {
+                Ok(timeout) => match timeout {
+                    Ok(conn) => {
+                        connection.replace(conn);
+                        break;
+                    }
+                    Err(_err) => {
+                        continue;
+                    }
+                },
+                Err(_cr) => {
+                    warn!("Connect to: {} timeout", addr);
+                    continue;
+                }
+            };
+        }
 
-        // 将连接存入缓存
-        self.remote_nodes
-            .insert(*nodeid.local_id(), connection.clone());
-
-        Ok(connection)
+        match connection {
+            Some(connection) => {
+                tracing::Span::current().record("remote", connection.remote_address().to_string());
+                info!("Connected to server: {:?}", connection.remote_address());
+                // 将连接存入缓存
+                self.remote_nodes
+                    .insert(*nodeid.local_id(), connection.clone());
+                return Ok(connection);
+            }
+            None => {
+                rootcause::bail!("连接到节点: {:?}出错", addrs);
+            }
+        }
     }
 
     /// 异步的消息发送
@@ -309,7 +356,7 @@ impl<M: MessagePayload> ServerHandle<M> {
     /// 同步的消息发送
     pub fn send_protocol_message(
         &self,
-        destination: NodeId,
+        destination: &NodeId,
         protocol_message: P2pNodeProtocolMessage<M>,
     ) -> Result<(), Report> {
         // 构建一个 tokio 运行时： Runtime
@@ -324,7 +371,6 @@ impl<M: MessagePayload> ServerHandle<M> {
 
     /// 执行异步的消息发送
     /// 实际的消息发送将会在这里发送
-    #[tracing::instrument(skip_all, fields(sender = %self.endpoint.local_addr().expect("never fails").to_string()))]
     pub async fn send_protocol_message_async(
         &self,
         destination: NodeId,
