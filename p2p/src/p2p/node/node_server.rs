@@ -186,8 +186,8 @@ impl<M: MessagePayload> ServerHandle<M> {
         let mut connection_id = None;
         let mut hanle = async || -> Result<(), Report> {
             loop {
-                match conn.accept_bi().await {
-                    Ok((_tx, rx)) => {
+                match conn.accept_uni().await {
+                    Ok(rx) => {
                         let mut framed_reader = FramedRead::new(rx, LengthDelimitedCodec::new());
                         while let Some(bytes_mut) = framed_reader.next().await {
                             let bytes = bytes_mut?;
@@ -212,7 +212,9 @@ impl<M: MessagePayload> ServerHandle<M> {
                                         node_id.local_id().short()
                                     ),
                                 );
-                                // self.set_connection(&node_id, conn.clone()).await;
+                                // 存储反向连接（从远程节点发起的连接）
+                                self.remote_nodes
+                                    .insert(node_id.local_id().clone(), conn.clone());
                                 connection_id = Some(node_id);
                             }
 
@@ -243,7 +245,7 @@ impl<M: MessagePayload> ServerHandle<M> {
         };
 
         if let Err(e) = hanle().await {
-            error!("Handle connection err: {e}");
+            error!("Handle connection: {addr}, err: {e}");
         }
         // 已经退出循环了，发送断联消息
         if let Some(connection_id) = connection_id {
@@ -323,6 +325,12 @@ impl<M: MessagePayload> ServerHandle<M> {
             Some(connection) => {
                 tracing::Span::current().record("remote", connection.remote_address().to_string());
                 info!("Connected to server: {:?}", connection.remote_address());
+                let handle = self.clone();
+                let conn_cloned = connection.clone();
+                // 接收连接消息
+                tokio::spawn(async move {
+                    handle.handle_connection(conn_cloned).await;
+                });
                 // 将连接存入缓存
                 self.remote_nodes
                     .insert(*nodeid.local_id(), connection.clone());
@@ -379,9 +387,10 @@ impl<M: MessagePayload> ServerHandle<M> {
         debug!("Send a protocol message: {protocol_message:?} to {destination:?}");
         let protocol_message = serde_json::to_vec(&protocol_message)?;
         let connection = self.get_connection(&destination).await?;
-        let (tx, _rx) = connection.open_bi().await?;
+        let tx = connection.open_uni().await?;
         let mut framed_writer = FramedWrite::new(tx, LengthDelimitedCodec::new());
         framed_writer.send(Bytes::from(protocol_message)).await?;
+        tokio::time::timeout(Duration::from_secs(5), framed_writer.close()).await??;
         Ok(())
     }
 
