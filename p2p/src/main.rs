@@ -74,7 +74,7 @@ async fn main() -> Result<(), Report> {
         ));
     }
 
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(1);
     let token = CancellationToken::new();
     let cloned_token = token.clone();
     let chat_node = ChatNode::new(p2pnode, rx, cloned_token);
@@ -82,39 +82,58 @@ async fn main() -> Result<(), Report> {
     let handle = server.handle();
     tokio::spawn(server);
     tokio::spawn(chat_node);
+    std::thread::spawn(move || input_loop(tx, local_id));
 
-    tokio::spawn(async move {
-        use tokio::io::{AsyncBufReadExt, BufReader};
+    // tokio::spawn(async move {
+    //     use tokio::io::{AsyncBufReadExt, BufReader};
 
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin);
-        let mut line = String::new();
+    //     let stdin = tokio::io::stdin();
+    //     let mut reader = BufReader::new(stdin);
+    //     let mut line = String::new();
 
-        loop {
-            let user = local_id;
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    let msg = ChatMessage::new(
-                        chrono::Local::now(),
-                        line.trim().to_string(),
-                        chat::UserType::User(user),
-                    );
-                    if tx.send(msg).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!("Error reading stdin: {}", e);
-                    break;
-                }
-            }
-        }
-    });
+    //     loop {
+    //         let user = local_id;
+    //         line.clear();
+    //         match reader.read_line(&mut line).await {
+    //             Ok(0) => break, // EOF
+    //             Ok(_) => {
+    //                 let msg = ChatMessage::new(
+    //                     chrono::Local::now(),
+    //                     line.trim().to_string(),
+    //                     chat::UserType::User(user),
+    //                 );
+    //                 if tx.send(msg).is_err() {
+    //                     break;
+    //                 }
+    //             }
+    //             Err(e) => {
+    //                 warn!("Error reading stdin: {}", e);
+    //                 break;
+    //             }
+    //         }
+    //     }
+    // });
 
     // tokio::signal::ctrl_c().await?;
     token.cancelled().await;
     handle.stop_server().await?;
     Ok(())
+}
+
+fn input_loop(
+    line_tx: tokio::sync::mpsc::Sender<ChatMessage>,
+    user: LocalNodeId,
+) -> Result<(), Report> {
+    let mut buffer = String::new();
+    let stdin = std::io::stdin(); // We get `Stdin` here.
+    loop {
+        stdin.read_line(&mut buffer)?;
+        let msg = ChatMessage::new(
+            chrono::Local::now(),
+            buffer.trim().to_string(),
+            chat::UserType::User(user),
+        );
+        line_tx.blocking_send(msg)?;
+        buffer.clear();
+    }
 }

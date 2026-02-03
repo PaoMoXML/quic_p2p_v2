@@ -31,6 +31,7 @@ pub mod message;
 mod misc;
 pub mod node_id;
 pub mod node_server;
+pub mod clock;
 
 const TICK_FPS: f64 = 10.0;
 
@@ -96,6 +97,7 @@ impl<M: MessagePayload> P2PNode<M> {
             id: id.clone(),
             payload: message_payload,
         };
+        
         self.plumtree_node.broadcast_message(m);
         id
     }

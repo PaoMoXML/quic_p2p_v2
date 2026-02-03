@@ -35,4 +35,3 @@ pub enum P2pNodeProtocolMessage<T: Clone> {
     Hyparview(hyparview::message::ProtocolMessage<NodeId>),
     Plumtree(plumtree::message::ProtocolMessage<PlumtreeSystem<T>>),
 }
-

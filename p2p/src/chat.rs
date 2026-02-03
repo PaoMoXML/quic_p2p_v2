@@ -35,13 +35,19 @@ impl ChatMessage {
 
 impl Display for ChatMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} [{}] => {}", self.user, self.time.to_rfc3339(), self.content)
+        write!(
+            f,
+            "{} [{}] => {}",
+            self.user,
+            self.time.to_rfc3339(),
+            self.content
+        )
     }
 }
 
 impl MessagePayload for ChatMessage {}
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum UserType {
     User(LocalNodeId),
     System,
@@ -59,14 +65,14 @@ impl Display for UserType {
 #[derive(Debug)]
 pub struct ChatNode {
     inner: P2PNode<ChatMessage>,
-    message_rx: mpsc::UnboundedReceiver<ChatMessage>,
+    message_rx: mpsc::Receiver<ChatMessage>,
     cloned_token: CancellationToken,
 }
 
 impl ChatNode {
     pub fn new(
         node: P2PNode<ChatMessage>,
-        message_rx: mpsc::UnboundedReceiver<ChatMessage>,
+        message_rx: mpsc::Receiver<ChatMessage>,
         cloned_token: CancellationToken,
     ) -> Self {
         Self {
