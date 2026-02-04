@@ -7,7 +7,6 @@ use std::net::SocketAddrV4;
 use std::net::ToSocketAddrs;
 use std::net::UdpSocket;
 use std::sync::Arc;
-use std::time::Duration;
 use stun_codec::rfc5389::Attribute;
 use stun_codec::{Message, MessageClass, MessageEncoder, rfc5389};
 use stun_codec::{TransactionId, rfc5389::methods};

@@ -1,45 +1,43 @@
-use std::{net::SocketAddr, sync::Arc, task::Poll, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    task::Poll,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use crypto::{digest::Digest, sha2::Sha256};
 use futures::Stream;
 use plumtree::time::NodeTime;
-use quinn::{
-    Endpoint, ServerConfig,
-    crypto::rustls::{QuicClientConfig, QuicServerConfig},
-};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rootcause::Report;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tracing::{debug, info, warn};
 
-use crate::p2p::{
-    node::{
-        message::{MessageId, MessagePayload, P2pNodeProtocolMessage},
-        misc::{HyparviewAction, HyparviewNode, PlumtreeAction, PlumtreeAppMessage, PlumtreeNode},
-        node_id::{NodeId, SecretKey},
-        node_server::{NodeHandle, ServerHandle},
-    },
-    tls::{
-        TlsConfig,
-        resolver::AlwaysResolvesCert,
-        verifier::{self, ClientCertificateVerifier, ServerCertificateVerifier},
-    },
+use crate::p2p::node::{
+    message::{MessageId, MessagePayload, P2pNodeProtocolMessage},
+    misc::{HyparviewAction, HyparviewNode, PlumtreeAction, PlumtreeAppMessage, PlumtreeNode},
+    node_id::NodeId,
+    node_server::{NodeHandle, ServerHandle},
 };
 
 pub mod args;
+pub mod clock;
 pub mod message;
 mod misc;
 pub mod node_id;
 pub mod node_server;
-pub mod clock;
 
 const TICK_FPS: f64 = 10.0;
+const MAX_OUT_OF_ORDER_DELAY_MS: u64 = 1000; // 最大允许的乱序等待时间（1秒）
+const MAX_PROCESSED_CACHE_LEN: usize = 50;
+const MAX_CLEANUP_PER_CALL: usize = 5;
 
 #[derive(Debug)]
 pub struct P2PNode<M: MessagePayload> {
     hyparview_node: HyparviewNode,
     plumtree_node: PlumtreeNode<M>,
     message_seqno: u64,
+    message_buffer: BTreeMap<u64, (PlumtreeAppMessage<M>, u64)>, // (消息, 接收时间戳)
+    processed_messages: VecDeque<u64>,                           // 已处理的时间戳集合
     server: ServerHandle<M>,
     message_rx: UnboundedReceiver<P2pNodeProtocolMessage<M>>,
     params: Parameters,
@@ -69,6 +67,8 @@ impl<M: MessagePayload> P2PNode<M> {
             hyparview_node: hyparview::Node::new(node_id, StdRng::from_seed(rand::rng().random())),
             plumtree_node,
             message_seqno: 0,
+            message_buffer: BTreeMap::new(), // 初始化消息缓冲区
+            processed_messages: VecDeque::new(),
             server,
             message_rx,
             params,
@@ -89,7 +89,12 @@ impl<M: MessagePayload> P2PNode<M> {
     ///
     /// 请注意，该消息也会发送给发送节点。
     pub fn broadcast(&mut self, message_payload: M) -> MessageId {
-        let id = MessageId::new(self.id(), self.message_seqno);
+        // 获取当前时间戳用于全局排序
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as u64;
+        let id = MessageId::new(self.id(), self.message_seqno, timestamp);
         self.message_seqno += 1;
         debug!("Starts broadcasting a message: {:?}", id);
 
@@ -97,9 +102,64 @@ impl<M: MessagePayload> P2PNode<M> {
             id: id.clone(),
             payload: message_payload,
         };
-        
+
         self.plumtree_node.broadcast_message(m);
         id
+    }
+
+    /// 按时间戳顺序处理消息
+    fn process_sequential_messages(&mut self) -> Option<PlumtreeAppMessage<M>> {
+        if let Some(cleanup_expired_messages) = self.cleanup_expired_messages() {
+            return Some(cleanup_expired_messages);
+        }
+        if let Some((&timestamp, _)) = self.message_buffer.iter().next() {
+            // 第一条消息
+            if self.processed_messages.is_empty() {
+                // 第一条消息不反回等待后续消息，如果超时就会直接在cleanup_expired_messages中输出
+                return None;
+            } else {
+                // 非顺序到达
+                if self.processed_messages.back().expect("Never fails") > &timestamp {
+                    return None;
+                }
+                // 顺序到达
+                if self.processed_messages.back() <= Some(&timestamp) {
+                    if let Some((message, _)) = self.message_buffer.remove(&timestamp) {
+                        self.processed_messages.push_back(timestamp);
+                        return Some(message);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn cleanup_expired_messages(&mut self) -> Option<PlumtreeAppMessage<M>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_millis() as u64;
+
+        // 数据太多清除一下，每次最多清理固定数量以避免性能抖动
+        let len = self.processed_messages.len();
+        if len > MAX_PROCESSED_CACHE_LEN {
+            let to_remove = std::cmp::min(len - MAX_PROCESSED_CACHE_LEN, MAX_CLEANUP_PER_CALL);
+            for _ in 0..to_remove {
+                self.processed_messages.pop_front();
+            }
+        }
+
+        if let Some((&timestamp, (_, receive_time))) = self.message_buffer.iter().next() {
+            // 防止时间回拨导致的算术下溢
+            if &now >= receive_time && now - receive_time > MAX_OUT_OF_ORDER_DELAY_MS {
+                if let Some((message, _)) = self.message_buffer.remove(&timestamp) {
+                    self.processed_messages.push_back(timestamp);
+                    return Some(message);
+                }
+            }
+        }
+        None
     }
 
     /// 返回节点的标识符。
@@ -171,7 +231,18 @@ impl<M: MessagePayload> P2PNode<M> {
             }
             plumtree::Action::Deliver { message } => {
                 debug!("Delivers an application message: {:?}", message.id);
-                Some(PlumtreeAppMessage::from(message))
+                // 记录当前时间，用于后续超时判断
+                let receive_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_else(|_| Duration::from_secs(0))
+                    .as_millis() as u64;
+                // 将消息放入缓冲区，按时间戳排序
+                self.message_buffer
+                    .insert(message.id.timestamp(), (message.clone(), receive_time));
+
+                // 尝试处理下一个应该处理的消息
+                self.process_sequential_messages()
+                // Some(PlumtreeAppMessage::from(message))
             }
         }
     }
@@ -259,6 +330,11 @@ impl<M: MessagePayload> Stream for P2PNode<M> {
             while let Some(action) = node.hyparview_node.poll_action() {
                 node.handle_hyparview_action(action);
                 did_something = true;
+            }
+
+            // 检查是否有可立即返回的消息（来自缓冲区）
+            if let Some(msg) = node.process_sequential_messages() {
+                return Poll::Ready(Some(msg));
             }
 
             while let Some(action) = node.plumtree_node.poll_action() {

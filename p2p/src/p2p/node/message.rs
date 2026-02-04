@@ -8,6 +8,7 @@ use crate::p2p::node::{misc::PlumtreeSystem, node_id::NodeId};
 pub struct MessageId {
     node: NodeId,
     seqno: u64,
+    timestamp: u64, // 添加全局时间戳字段
 }
 impl MessageId {
     /// Returns the node identifier part of the message identifier.
@@ -20,8 +21,16 @@ impl MessageId {
         self.seqno
     }
 
-    pub(crate) fn new(node: NodeId, seqno: u64) -> Self {
-        MessageId { node, seqno }
+    /// Returns the timestamp part of the message identifier.
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+    pub(crate) fn new(node: NodeId, seqno: u64, timestamp: u64) -> Self {
+        MessageId {
+            node,
+            seqno,
+            timestamp,
+        }
     }
 }
 
