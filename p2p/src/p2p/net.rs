@@ -14,7 +14,7 @@ use tracing::debug;
 
 pub struct Endpoint {}
 
-pub const PUB_STUN: [&'static str; 4] = [
+pub const PUB_STUN: [&str; 4] = [
     "stun.chat.bilibili.com:3478",
     "stun.miwifi.com:3478",
     "stun.hitv.com:3478",
@@ -56,8 +56,7 @@ pub async fn stun_addr(socket: &UdpSocket) -> Result<std::net::SocketAddr, Repor
     // 如果所有服务器都失败，则返回最后一个错误
     match last_err {
         Some(err) => Err(err),
-        None => Err(Report::from(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        None => Err(Report::from(std::io::Error::other(
             "No STUN servers available",
         ))),
     }
@@ -108,35 +107,30 @@ async fn get_external_ip_from_stun(
     // 解码响应
     let mut decoder = stun_codec::MessageDecoder::<Attribute>::new();
     let response = decoder.decode_from_bytes(&response_buffer[..len])?;
-    match response {
-        Ok(response) => {
-            // 检查是否是成功响应
-            if response.class() != MessageClass::SuccessResponse {
-                return Err(Report::from(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "STUN server returned error",
-                )));
-            }
+    if let Ok(response) = response {
+        // 检查是否是成功响应
+        if response.class() != MessageClass::SuccessResponse {
+            return Err(Report::from(std::io::Error::other(
+                "STUN server returned error",
+            )));
+        }
 
-            // 查找 XOR_MAPPED_ADDRESS 属性
-            for attr in response.attributes() {
-                if let Attribute::XorMappedAddress(address) = attr {
-                    return Ok(address.address());
-                }
-            }
-
-            // 如果没有找到 XOR_MAPPED_ADDRESS，尝试 MAPPED_ADDRESS
-            for attr in response.attributes() {
-                if let Attribute::MappedAddress(address) = attr {
-                    return Ok(address.address());
-                }
+        // 查找 XOR_MAPPED_ADDRESS 属性
+        for attr in response.attributes() {
+            if let Attribute::XorMappedAddress(address) = attr {
+                return Ok(address.address());
             }
         }
-        Err(_) => {}
+
+        // 如果没有找到 XOR_MAPPED_ADDRESS，尝试 MAPPED_ADDRESS
+        for attr in response.attributes() {
+            if let Attribute::MappedAddress(address) = attr {
+                return Ok(address.address());
+            }
+        }
     }
 
-    Err(Report::from(std::io::Error::new(
-        std::io::ErrorKind::Other,
+    Err(Report::from(std::io::Error::other(
         "No mapped address found in STUN response",
     )))
 }

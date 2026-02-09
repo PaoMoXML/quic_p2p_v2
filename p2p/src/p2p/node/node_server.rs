@@ -1,4 +1,5 @@
 use std::{
+    cell::LazyCell,
     collections::HashSet,
     net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
@@ -8,14 +9,18 @@ use std::{
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use hyparview::message::{DisconnectMessage, ProtocolMessage};
-use quinn::{ApplicationClose, Connection, Endpoint};
-use rootcause::Report;
-use tokio::sync::{Mutex, mpsc::UnboundedSender};
+use quinn::{ApplicationClose, Connection, Endpoint, RecvStream};
+use rootcause::{Report, prelude::ResultExt};
+use tokio::sync::{
+    Mutex,
+    mpsc::{self, UnboundedSender},
+    oneshot,
+};
 use tokio_util::{
     bytes::Bytes,
     codec::{FramedRead, FramedWrite, LengthDelimitedCodec},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::p2p::{
     net::create_endpoint,
@@ -65,7 +70,7 @@ impl P2PNodeServerBuilder {
 
         let handle = ServerHandle {
             endpoint,
-            local_nodes: Arc::new(RwLock::new(None)),
+            local_node: Arc::new(RwLock::new(None)),
             remote_nodes: Arc::new(DashMap::new()),
             connection_locks: Arc::new(DashMap::new()),
         };
@@ -141,16 +146,13 @@ impl<M: MessagePayload> Future for P2PNodeServer<M> {
 #[derive(Debug, Clone)]
 pub struct ServerHandle<M: MessagePayload> {
     endpoint: Endpoint,
-    local_nodes: Arc<RwLock<Option<(LocalNodeId, NodeHandle<M>)>>>,
+    local_node: Arc<RwLock<Option<(LocalNodeId, NodeHandle<M>)>>>,
     remote_nodes: Arc<DashMap<LocalNodeId, Connection>>,
     connection_locks: Arc<DashMap<LocalNodeId, Arc<Mutex<()>>>>,
 }
 
 impl<M: MessagePayload> ServerHandle<M> {
-    /// 启动quic客户端
-    // #[tracing::instrument(skip_all, fields(local_addr=%*self.local_nodes.read().as_ref().unwrap().unwrap().0.to_string()))]
     pub async fn start_server(&self) -> Result<(), Report> {
-        // info!("Local ips: {:?}",self.local_nodes.read().unwrap());
         info!("Server listen on: {}", self.endpoint.local_addr()?);
         // 接受传入连接
         loop {
@@ -182,56 +184,45 @@ impl<M: MessagePayload> ServerHandle<M> {
     /// 监听连接
     #[tracing::instrument(skip_all, fields(me = self.get_local_nodeid().expect("never fails").short(), remote))]
     async fn handle_connection(&self, conn: Connection) {
-        let addr = conn.remote_address();
-        let mut connection_id = None;
-        let mut hanle = async || -> Result<(), Report> {
+        let (node_id_tx, mut node_id_rx) = tokio::sync::mpsc::channel::<NodeId>(1);
+        let node_id_op = Arc::new(Mutex::new(None));
+        let node_id_op_clone = node_id_op.clone();
+        let handle = self.clone();
+        let conn_cloned = conn.clone();
+        let span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                if let Some(node_id) = node_id_rx.recv().await {
+                    // 存储反向连接（从远程节点发起的连接）
+                    handle.remote_nodes.insert(*node_id.local_id(), conn_cloned);
+                    node_id_op_clone.lock().await.replace(node_id);
+                    node_id_rx.close();
+                }
+            }
+            .instrument(span.clone()),
+        );
+
+        let async_handle = async || -> Result<(), Report> {
             loop {
                 match conn.accept_uni().await {
                     Ok(rx) => {
-                        let mut framed_reader = FramedRead::new(rx, LengthDelimitedCodec::new());
-                        while let Some(bytes_mut) = framed_reader.next().await {
-                            let bytes = bytes_mut?;
-                            let p2p_node_protocol_message: P2pNodeProtocolMessage<M> =
-                                serde_json::from_slice(&bytes)?;
-                            debug!("Fetch a protocol message: {p2p_node_protocol_message:?}");
-                            if connection_id.is_none() {
-                                let node_id = match &p2p_node_protocol_message {
-                                    P2pNodeProtocolMessage::Hyparview(protocol_message) => {
-                                        protocol_message.sender().clone()
-                                    }
-                                    P2pNodeProtocolMessage::Plumtree(protocol_message) => {
-                                        protocol_message.sender().clone()
-                                    }
+                        let handle = self.clone();
+                        let node_id_tx = node_id_tx.clone();
+                        tokio::spawn(
+                            async move {
+                                if let Err(err) = handle.handle_recv_stream(rx, node_id_tx).await {
+                                    warn!("Handle recv stream err: {err}");
                                 };
-                                debug!("Handle a connection from: {node_id:?}");
-                                tracing::Span::current().record(
-                                    "remote",
-                                    format!(
-                                        "NodeId ( address: {:?}, local_id: {} )",
-                                        node_id.address(),
-                                        node_id.local_id().short()
-                                    ),
-                                );
-                                // 存储反向连接（从远程节点发起的连接）
-                                self.remote_nodes
-                                    .insert(node_id.local_id().clone(), conn.clone());
-                                connection_id = Some(node_id);
                             }
-
-                            if let Ok(read) = self.local_nodes.read()
-                                && let Some((_id, node)) = read.as_ref()
-                            {
-                                node.message_tx.send(p2p_node_protocol_message)?;
-                            }
-                        }
+                            .instrument(span.clone()),
+                        );
                     }
                     Err(quinn::ConnectionError::ApplicationClosed(ApplicationClose {
                         error_code,
                         reason,
                     })) => {
-                        debug!(
-                            "IP: {} Closed: error_code={}, reason={}",
-                            addr,
+                        info!(
+                            "Connection closed: error_code={}, reason={}",
                             error_code,
                             String::from_utf8_lossy(&reason)
                         );
@@ -244,18 +235,60 @@ impl<M: MessagePayload> ServerHandle<M> {
             }
         };
 
-        if let Err(e) = hanle().await {
-            error!("Handle connection: {addr}, err: {e}");
+        if let Err(e) = async_handle().await {
+            error!("Handle connection err: {e}");
         }
         // 已经退出循环了，发送断联消息
-        if let Some(connection_id) = connection_id {
-            self.notify_self_disconnect(&connection_id);
+        if let Ok(mut node_id_guard) = node_id_op.try_lock_owned()
+            && let Some(node_id) = node_id_guard.take()
+        {
+            self.notify_self_disconnect(&node_id);
+        };
+    }
+
+    /// 处理recv stream
+    async fn handle_recv_stream(
+        &self,
+        rx: RecvStream,
+        node_id_tx: mpsc::Sender<NodeId>,
+    ) -> Result<(), Report> {
+        let mut framed_reader = FramedRead::new(rx, LengthDelimitedCodec::new());
+        while let Some(bytes_mut) = framed_reader.next().await {
+            let bytes = bytes_mut?;
+            let p2p_node_protocol_message: P2pNodeProtocolMessage<M> =
+                serde_json::from_slice(&bytes)?;
+            debug!("Fetch a protocol message: {p2p_node_protocol_message:?}");
+            // 专递node_id的通道没有关闭的话就发送通知，否则就是已经传递过了
+            if !node_id_tx.is_closed() {
+                let node_id = match &p2p_node_protocol_message {
+                    P2pNodeProtocolMessage::Hyparview(protocol_message) => {
+                        Some(protocol_message.sender().clone())
+                    }
+                    P2pNodeProtocolMessage::Plumtree(protocol_message) => {
+                        Some(protocol_message.sender().clone())
+                    }
+                    P2pNodeProtocolMessage::PlumtreeStream(_plumtree_stream_message) => None,
+                };
+                if let Some(node_id) = node_id {
+                    tracing::Span::current().record("remote", node_id.to_string());
+                    let _ = node_id_tx.send(node_id).await;
+                }
+            }
+
+            // 将消息传递给本地node
+            if let Ok(read) = self.local_node.read()
+                && let Some((_id, node)) = read.as_ref()
+            {
+                node.message_tx.send(p2p_node_protocol_message)?;
+            }
         }
+
+        Ok(())
     }
 
     /// 注册本地的节点
     pub(crate) fn register_local_node(&self, node: NodeHandle<M>) {
-        if let Ok(mut write) = self.local_nodes.write() {
+        if let Ok(mut write) = self.local_node.write() {
             write.replace((node.local_id, node));
         }
     }
@@ -265,10 +298,10 @@ impl<M: MessagePayload> ServerHandle<M> {
     }
 
     pub fn get_local_nodeid(&self) -> Option<LocalNodeId> {
-        if let Ok(read) = self.local_nodes.read()
+        if let Ok(read) = self.local_node.read()
             && let Some((id, _node)) = read.as_ref()
         {
-            Some(id.clone())
+            Some(*id)
         } else {
             None
         }
@@ -298,6 +331,7 @@ impl<M: MessagePayload> ServerHandle<M> {
         let addrs = nodeid.address();
         let mut connection = None;
         for addr in addrs {
+            // 请求超时5s就放弃
             match tokio::time::timeout(
                 Duration::from_secs(5),
                 self.endpoint
@@ -323,7 +357,6 @@ impl<M: MessagePayload> ServerHandle<M> {
 
         match connection {
             Some(connection) => {
-                tracing::Span::current().record("remote", connection.remote_address().to_string());
                 info!("Connected to server: {:?}", connection.remote_address());
                 let handle = self.clone();
                 let conn_cloned = connection.clone();
@@ -394,6 +427,14 @@ impl<M: MessagePayload> ServerHandle<M> {
         Ok(())
     }
 
+    pub async fn send_protocol_message_stream_async(
+        &self,
+        destination: NodeId,
+        protocol_message: P2pNodeProtocolMessage<M>,
+    ) -> Result<(), Report> {
+        Ok(())
+    }
+
     /// 提醒断联
     /// 发送给本地节点，destination需要断联
     pub fn notify_self_disconnect(&self, destination: &NodeId) {
@@ -404,41 +445,13 @@ impl<M: MessagePayload> ServerHandle<M> {
         };
         let message = ProtocolMessage::Disconnect(message);
         let message = P2pNodeProtocolMessage::Hyparview(message);
-        if let Ok(read) = self.local_nodes.read()
+        if let Ok(read) = self.local_node.read()
             && let Some((_id, node)) = read.as_ref()
         {
             let _ = node.message_tx.send(message);
         }
         self.remove_remote_node(destination.local_id());
     }
-}
-
-// impl<M: MessagePayload> Future for ServerHandle<M> {
-//     type Output = ();
-
-//     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-//         let handle = self.get_mut();
-//         while let Poll::Ready(Some(conn)) = pin!(handle.endpoint.accept()).poll_unpin(cx) {
-//             if let Ok(mut accept) = conn.accept() {
-//                 if let Poll::Ready(Ok(connection)) = accept.poll_unpin(cx) {
-//                     let handle_cloned = handle.clone();
-//                     tokio::spawn(async move {
-//                         if let Err(e) = handle_cloned.handle_connection(connection).await {
-//                             error!("Handle connection err: {e}");
-//                         }
-//                     });
-//                 }
-//             };
-//         }
-//         cx.waker().wake_by_ref();
-//         Poll::Pending
-//     }
-// }
-
-#[derive(Debug)]
-enum Command<M: MessagePayload> {
-    Register(NodeHandle<M>),
-    Deregister(LocalNodeId),
 }
 
 #[derive(Debug, Clone)]

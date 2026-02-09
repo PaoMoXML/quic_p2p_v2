@@ -15,6 +15,13 @@ pub struct ChatMessage {
     user: UserType,
 }
 
+// #[derive(Serialize, Deserialize, Clone, Debug)]
+// pub struct ChatMessageStream {
+//     time: DateTime<Utc>,
+//     content: tokio_stream::wrappers::ReceiverStream<String>,
+//     user: UserType,
+// }
+
 impl ChatMessage {
     pub fn new(local_time: DateTime<Local>, content: String, user: UserType) -> Self {
         Self {
@@ -35,11 +42,12 @@ impl ChatMessage {
 
 impl Display for ChatMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let local_time: DateTime<Local> = self.time.into();
         write!(
             f,
             "{} [{}] => {}",
             self.user,
-            self.time.to_rfc3339(),
+            local_time.to_rfc3339(),
             self.content
         )
     }

@@ -43,22 +43,22 @@ impl VectorClock {
             other
                 .timestamps
                 .get(node)
-                .map_or(false, |other_ts| ts >= other_ts)
+                .is_some_and(|other_ts| ts >= other_ts)
         }) && self.timestamps.iter().any(|(node, ts)| {
             other
                 .timestamps
                 .get(node)
-                .map_or(false, |other_ts| ts > other_ts)
+                .is_some_and(|other_ts| ts > other_ts)
         });
 
         let other_is_greater = other.timestamps.iter().all(|(node, ts)| {
             self.timestamps
                 .get(node)
-                .map_or(false, |self_ts| ts < self_ts)
+                .is_some_and(|self_ts| ts < self_ts)
         }) && other.timestamps.iter().any(|(node, ts)| {
             self.timestamps
                 .get(node)
-                .map_or(false, |self_ts| ts < self_ts)
+                .is_some_and(|self_ts| ts < self_ts)
         });
 
         if self_is_greater && other_is_greater {

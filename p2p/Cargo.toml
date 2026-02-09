@@ -12,7 +12,6 @@ futures = "0.3.30"
 rootcause = { version = "0.11.0" }
 dashmap = { version = "6.1.0" }
 quinn = "0.11.6"
-memmap2 = "0.9.5"
 clap = { version = "4.5.32", features = ["derive"] }
 log = { version = "0.4.27" }
 tracing = "0.1"
@@ -22,12 +21,9 @@ unicode-width = "0.2.0"
 rust-crypto = { version = "0.2.36" }
 serde = { workspace = true }
 serde_json = { version = "1.0.133" }
-bincode = { version = "2.0.1", features = ["serde"] }
 rustls = { version = "0.23.23", features = ["ring"] }
-reqwest = { version = "0.13.1", features = ["blocking", "json", "stream"] }
+reqwest = { version = "0.13.1", features = ["json", "stream"] }
 toml = { version = "0.9.8" }
-markdown = { version = "1.0.0", features = ["json"] }
-termcolor = "1.4.1"
 rand = { workspace = true }
 hyparview = { path = "../hyparview" }
 plumtree = { path = "../plumtree" }
@@ -36,9 +32,12 @@ ed25519-dalek = { version = "2.2.0", features = ["pkcs8", "serde", "pem"] }
 data-encoding = "2.10.0"
 thiserror = "2.0.18"
 # rand_core = "0.9.5"
-stun_codec ={ version = "0.4"}
+stun_codec = { version = "0.4" }
 bytecodec = "0.5.0"
 # socket2 = "0.6.1"
+
+markdown = { version = "1.0.0", features = ["json"] }
+termcolor = "1.4.1"
 
 
 [features]

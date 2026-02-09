@@ -1,13 +1,9 @@
-use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    str::FromStr,
-};
+use std::str::FromStr;
 
 use clap::Parser;
 use rootcause::Report;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
 use tracing_subscriber::{
     fmt::{time, writer::MakeWriterExt},
     layer::SubscriberExt,

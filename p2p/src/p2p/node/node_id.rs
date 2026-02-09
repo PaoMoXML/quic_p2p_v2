@@ -186,3 +186,14 @@ impl NodeId {
         &self.local_id
     }
 }
+
+impl Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "NodeId (address: {:?}, local_id: {})",
+            self.address(),
+            self.local_id().short()
+        )
+    }
+}

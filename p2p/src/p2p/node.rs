@@ -123,12 +123,11 @@ impl<M: MessagePayload> P2PNode<M> {
                     return None;
                 }
                 // 顺序到达
-                if self.processed_messages.back() <= Some(&timestamp) {
-                    if let Some((message, _)) = self.message_buffer.remove(&timestamp) {
+                if self.processed_messages.back() <= Some(&timestamp)
+                    && let Some((message, _)) = self.message_buffer.remove(&timestamp) {
                         self.processed_messages.push_back(timestamp);
                         return Some(message);
                     }
-                }
             }
         }
 
@@ -152,12 +151,11 @@ impl<M: MessagePayload> P2PNode<M> {
 
         if let Some((&timestamp, (_, receive_time))) = self.message_buffer.iter().next() {
             // 防止时间回拨导致的算术下溢
-            if &now >= receive_time && now - receive_time > MAX_OUT_OF_ORDER_DELAY_MS {
-                if let Some((message, _)) = self.message_buffer.remove(&timestamp) {
+            if &now >= receive_time && now - receive_time > MAX_OUT_OF_ORDER_DELAY_MS
+                && let Some((message, _)) = self.message_buffer.remove(&timestamp) {
                     self.processed_messages.push_back(timestamp);
                     return Some(message);
                 }
-            }
         }
         None
     }
@@ -261,6 +259,7 @@ impl<M: MessagePayload> P2PNode<M> {
                 }
                 false
             }
+            P2pNodeProtocolMessage::PlumtreeStream(plumtree_stream_message) => todo!(),
         }
     }
 
@@ -294,17 +293,17 @@ impl<M: MessagePayload> P2PNode<M> {
             "Leaves the current cluster: active_view={:?}",
             self.hyparview_node.active_view()
         );
-        for peer in self.hyparview_node.active_view().iter().cloned() {
+        for peer in self.hyparview_node.active_view() {
             let message = DisconnectMessage {
                 sender: self.id(),
                 alive: false,
             };
             let message = ProtocolMessage::Disconnect(message);
             let message = P2pNodeProtocolMessage::Hyparview(message);
-            if let Err(e) = self.server.send_protocol_message(&peer, message) {
+            if let Err(e) = self.server.send_protocol_message(peer, message) {
                 warn!("Leave err: {e}");
             }
-            self.server.notify_self_disconnect(&peer);
+            self.server.notify_self_disconnect(peer);
         }
     }
 }
